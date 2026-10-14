@@ -1,0 +1,2021 @@
+function out = robotic_fuel_station_complete(action, varargin)
+% ROBOTIC_FUEL_STATION_COMPLETE  Everything in ONE file (plain MATLAB, no Simulink).
+%
+%   robotic_fuel_station_complete('animate', ...)   animated workflow (flowchart + 3D robot,
+%                                                   pressure plot, fault handling)
+%   robotic_fuel_station_complete('graphs', ...)    fill time + pressure graphs, instant
+%
+% Calling it with no arguments, or with options only, starts the animation:
+%   robotic_fuel_station_complete('Fuel','diesel','Litres',30)
+%
+% The vehicle type is NEVER given to the station: it detects the type from where the fuel
+% inlet sits along the body (rear = CAR, middle = LORRY, front = BIKE).
+%
+% ANIMATION EXAMPLES
+%   robotic_fuel_station_complete('animate')                      % a random vehicle arrives
+%   robotic_fuel_station_complete('animate','Fuel','diesel','Litres',30)
+%   robotic_fuel_station_complete('animate','Fault','overpressure')
+%   robotic_fuel_station_complete('animate','Calibrated',false)   % camera error too big -> inlet NOT opened
+%   options: 'Fuel' petrol|diesel (customer), 'Litres', 'UnsafeParking' true|false,
+%            'Fault' false|'leak'|'overpressure', 'Obstacle' true|false,
+%            'VehicleMoves' false|'approach'|'fuelling',
+%            'MaxDetectError' (mm, default 1), 'CameraNoise' (mm, default 3),
+%            'Calibrated' true|false, 'Speed'
+%   TESTING ONLY (the station is not told these): 'Arrives' random|car|lorry|bike,
+%            'Seed' (repeat a random arrival), 'CarEngine' petrol|diesel (what an arriving car takes)
+%
+% DETECTION TEST (no graphics): how reliably is the vehicle type found from the inlet position?
+%   robotic_fuel_station_complete('classify')        % 300 random arrivals
+%   robotic_fuel_station_complete('classify',1000)
+%
+% GRAPH EXAMPLES  (fill time, pressure vs time, pressure vs % of litres)
+%   robotic_fuel_station_complete('graphs')                          % car, lorry, bike, full tanks
+%   robotic_fuel_station_complete('graphs','Vehicle','car','Litres',20)
+%   robotic_fuel_station_complete('graphs','Vehicle','lorry','Fault','overpressure')
+%   options: 'Vehicle' car|lorry|bike|all, 'Litres', 'Fault' none|leak|overpressure
+%
+% CONTINUOUS MULTI-VEHICLE STATION (uses the animated workflow above for EVERY vehicle) + OWNER'S REPORT
+%   robotic_fuel_station_complete('station')                          % vehicles keep arriving for 60 simulated minutes
+%   robotic_fuel_station_complete('station','Vehicles',10)            % 10 random vehicles
+%   robotic_fuel_station_complete('station','RunMinutes',Inf)         % runs until YOU close the window
+%   robotic_fuel_station_complete('station','Speed',20,'FrameSkip',4) % FAST animation
+%   robotic_fuel_station_complete('station','Live',false)             % same simulation, no drawing (instant)
+%   options: 'RunMinutes' (60), 'Vehicles' (cap, default Inf), 'Speed' (3, bigger = faster), 'FrameSkip' (1),
+%            'MaxLitres' (10 = biggest fill per vehicle), 'MeanGap' (150 s between arrivals), 'Seed', 'PetrolPrice' (105), 'DieselPrice' (92),
+%            'PetrolStock' (3000 L), 'DieselStock' (4000 L), 'WrongFuelChance' (0.08), 'FaultChance' (0.15),
+%            'File', 'StationName'
+%   Velocity / position / acceleration graphs: one PNG per vehicle + overview + motion_data.mat are saved in
+%   'GraphFolder' (default Fuel_Station_Graphs_<date_time>); switch off with 'SaveGraphs',false.
+%   Closing the window stops the run and still prints/saves the full report (Command Window + Excel).
+%
+% Close the figure window to stop the animation.
+
+if nargin < 1, action = 'animate'; varargin = {}; end
+known = {'animate','run','workflow','graphs','graph','fill','pressure','classify','detect','station','fleet','report'};
+if ~any(strcmpi(char(action), known))
+    % called with options only, e.g. robotic_fuel_station_complete('Fuel','diesel','Litres',30)
+    varargin = [{action}, varargin];
+    action = 'animate';
+end
+switch lower(action)
+    case {'animate','run','workflow'}
+        robotic_fuel_station_workflow(varargin{:});
+    case {'graphs','graph','fill','pressure'}
+        if nargout > 0, out = fill_time_pressure(varargin{:}); else, fill_time_pressure(varargin{:}); end
+    case {'classify','detect'}
+        classifyTest(varargin{:});
+    case {'station','fleet','report'}
+        if nargout > 0, out = stationSimulation(varargin{:}); else, stationSimulation(varargin{:}); end
+    otherwise
+        error('Unknown action "%s". Use ''animate'', ''graphs'' or ''classify''.', action);
+end
+end
+
+%% ##########################################################################
+%%  PART 1: ANIMATED WORKFLOW (flowchart, 3D robot, pressure, faults)
+%% ##########################################################################
+function res = robotic_fuel_station_workflow(varargin)
+% ROBOTIC_FUEL_STATION_WORKFLOW
+% Animated robotic fuel station that follows this exact workflow:
+%
+%   VEHICLE ARRIVES -> Vehicle detection -> Vehicle positioning -> Is position safe?
+%     NO  -> Reposition (back to positioning)        YES -> Detect fuel inlet
+%   -> Check fuel flap -> Calculate target -> Inverse Kinematics -> Collision Checking
+%   -> Trajectory Planning -> Dynamics + Controller -> Move Robot -> Alignment
+%   -> Nozzle Insertion -> Fuel Dispensing
+%        Normal operation: Stop at target -> Remove nozzle -> Return Home -> COMPLETE
+%        Fault detected  : Emergency stop -> Fuel OFF
+%
+% The left panel is the live flowchart (the active block lights up), the right
+% panel is the 3D robot / vehicle animation, with a controller tracking plot and
+% a status panel (fuel gauge, messages). No Simulink needed - plain MATLAB only.
+%
+% VEHICLE TYPE IS DETECTED, NOT GIVEN: after the inlet is located, its position along the
+%   body (measured from the LiDAR outline) decides the type: rear = CAR, middle = LORRY,
+%   front = BIKE. The type then selects the flap/cap/tank/flow profile.
+% INLET DETECTION GATE: the camera averages frames until the detected error (estimated
+%   inlet vs true inlet) is below 'MaxDetectError' (default 1 mm). The error is shown in the
+%   status panel, a banner and the Command Window. If it cannot get below the limit, the
+%   inlet/flap is NOT opened and the Fault branch runs.
+%
+% OPTIONS (name-value pairs)
+%   'Arrives'       TESTING ONLY: 'random' | 'car' | 'lorry' | 'bike' - what the simulator sends
+%                   in. The station is NOT told; it must detect the type.   (default 'random')
+%   'Seed'          integer to repeat the same random arrival               (default [])
+%   'MaxDetectError' detection error limit in mm                            (default 1)
+%   'CameraNoise'   per-axis noise of one camera frame in mm                (default 3)
+%   'Calibrated'    false = camera bias is not removed -> error too big -> inlet NOT opened (default true)
+%   'Fuel'          'petrol' | 'diesel'  (customer input)    (default 'petrol')
+%   'CarEngine'     'petrol' | 'diesel'  (what an arriving CAR takes, testing only) (default 'petrol')
+%   'Litres'        litres requested                         (default 10)
+%   'UnsafeParking' true = parks badly first -> shows NO path (default true)
+%   'Fault'         false | 'leak' | 'overpressure'  (true = 'leak')  (default false)
+%                   leak: line pressure falls below expected for the flow
+%                   overpressure: nozzle/hose blockage -> pressure rises above the trip limit
+%   'Obstacle'      true = puts a cart in the path -> collision replan (default false)
+%   'VehicleMoves'  false | 'approach' | 'fuelling' (true = 'fuelling')      (default false)
+%                   the vehicle creeps forward (driver releases the brake) while the arm
+%                   approaches / while fuel is pumping. The VEHICLE MOTION MONITOR compares the
+%                   vehicle pose with the pose measured when the inlet was located; more than
+%                   15 mm or 1 deg of movement -> Fault branch (Emergency stop, Fuel OFF).
+%   'Speed'         animation speed factor                   (default 3)
+%
+% FUEL LINE PRESSURE (Fuel Dispensing block): the pressure follows the quantity pumped.
+%   - start-up surge: pressure jumps to its MAXIMUM right after the pump starts
+%   - it then declines gradually as the dispensed fraction grows
+%   - over the last 15 % of the requested litres the flow tapers, so the pressure falls
+%     steeply and the fill finishes gently (like a real dispenser's slow-fill).
+%   P = P0 + k*Q^2 + surge(t) + head(fraction). Trip above 4.5 bar; leak detected if the
+%   pressure is below 70 % of expected. Asking for more than the tank holds shows the
+%   nozzle auto shut-off (back-pressure spike) at the end.
+%
+% Try:  'Fuel','diesel' with a petrol car  -> WRONG FUEL, refused, fault branch.
+%       Press the red EMERGENCY STOP button any time -> fault branch.
+
+%% ===================== inputs =====================
+ip = inputParser;
+addParameter(ip,'Vehicle','');           % old name, treated as 'Arrives' (the station is still NOT told)
+addParameter(ip,'Arrives','random');
+addParameter(ip,'Seed',[]);
+addParameter(ip,'MaxDetectError',1);
+addParameter(ip,'CameraNoise',3);
+addParameter(ip,'Calibrated',true);
+addParameter(ip,'Fuel','petrol');
+addParameter(ip,'CarEngine','petrol');
+addParameter(ip,'Litres',10);
+addParameter(ip,'UnsafeParking',true);
+addParameter(ip,'Fault',false);
+addParameter(ip,'Obstacle',false);
+addParameter(ip,'VehicleMoves',false);
+addParameter(ip,'Speed',3);
+addParameter(ip,'FrameSkip',1);        % draw only every Nth step (used by the multi-vehicle station)
+addParameter(ip,'Figure',[]);          % reuse this figure window (used by the multi-vehicle station)
+addParameter(ip,'NoiseSeed',7);        % seed of the sensor noise
+addParameter(ip,'Header','');          % text line shown at the top of the window
+parse(ip,varargin{:});
+P = ip.Results;
+arr = char(P.Arrives);
+if ~isempty(char(P.Vehicle))
+    arr = char(P.Vehicle);
+    fprintf('Note: the simulator sends in a %s, but the station is NOT told - it detects the type itself.\n', arr);
+end
+if strcmpi(arr,'random')
+    if isempty(P.Seed), rng('shuffle'); else, rng(P.Seed); end
+    pickList = {'car','lorry','bike'}; vname = pickList{randi(3)};
+else
+    vname = validatestring(arr,{'car','lorry','bike'});
+end
+fuelReq = find(strcmpi(char(P.Fuel),{'petrol','diesel'}));
+carEng  = find(strcmpi(char(P.CarEngine),{'petrol','diesel'}));
+if isempty(fuelReq), error('Fuel must be ''petrol'' or ''diesel''.'); end
+if isempty(carEng),  error('CarEngine must be ''petrol'' or ''diesel''.'); end
+fm = P.Fault;
+if islogical(fm) || isnumeric(fm)
+    if fm, faultMode = 'leak'; else, faultMode = 'none'; end
+else
+    faultMode = validatestring(lower(char(fm)),{'none','leak','overpressure'});
+end
+vm = P.VehicleMoves;
+if islogical(vm) || isnumeric(vm)
+    if vm, moveMode = 'fuelling'; else, moveMode = 'none'; end
+else
+    moveMode = validatestring(lower(char(vm)),{'none','approach','fuelling'});
+end
+V = vehicleDef(vname, carEng);
+fuelNames = {'PETROL','DIESEL'};
+rng(P.NoiseSeed);
+res = struct('closed',true);               % result for the multi-vehicle station (completed at the end)
+motionLog = zeros(0,14); lastAcc = [0 0 0];   % [t q1 q2 q3 qd1 qd2 qd3 qdd1 qdd2 qdd3 tipX tipY tipZ vehicleX]
+faultMsg = ''; peakP = 0; nRepark = 0; nReplan = 0; wasClosed = false; frameCount = 0;
+
+%% ===================== constants / shared state =====================
+L1 = 0.65; L2 = 0.65; z0 = 0.6;            % arm geometry (also inside ik3/fk3)
+homePos = [0.5 0.35 0.9];
+dt = 0.04; Kp = 100; Kd = 15;              % sim step, PD gains (wn = 10 rad/s)
+toolCol   = [0.55 0.55 0.55; 0.90 0.20 0.20; 0.10 0.70 0.20; 0.10 0.35 0.90];
+toolNames = {'none','press','cap gripper','nozzle'};
+calibBias = [0.006 -0.004 0.005];          % camera calibration error (m)
+ideal = V.ideal;
+if P.UnsafeParking
+    park = [ideal(1)+0.12, ideal(2)+0.22, deg2rad(6)];
+else
+    park = [ideal(1)+0.07, ideal(2)-0.03, deg2rad(1.5)];
+end
+repark = [ideal(1)+0.04, ideal(2)+0.02, deg2rad(1.0)];
+pose = [park(1)-8, park(2), 0];            % [x y yaw] of the vehicle
+targetLitres = P.Litres;                   % limited to the tank size once the type is detected
+flowRate = 0.8;                            % replaced by the detected profile's rated flow
+detCls = 0; detName = ''; detTitle = 'detecting...'; detFrac = NaN; detZone = ''; labelFuel = 0;
+detErrShow = NaN;                          % inlet detection error shown in the output (mm)
+Vd = struct('title','?','dirType','side','flap','none','tank',inf,'flow',0.8,'fuel',NaN);   % DETECTED profile
+
+q = ik3(homePos); qd = [0 0 0]; qRef = q;
+tool = 0; ndir = [0 1 0]; ndirGoal = [0 1 0];
+wrist = 0; flapAng = 0; capState = 1;      % cap: 1 on vehicle, 2 gripper, 3 tray
+litres = 0; flowing = false; valveOpen = false; seated = false;
+estopReq = false; inFault = false; curNode = ''; simT = 0; tClock = tic;
+est = struct('inlet',[0 0 0],'dir',[0 1 0]);
+infoMsg = ''; taskMsg = ''; stBlock = '';
+showHose = false;
+valveU = 0; flowQ = 0; pLine = 0; pTrack = false;     % valve opening 0..1, flow L/s, line pressure bar
+pBuf = []; tpBuf = []; pExpBuf = []; tFillStart = NaN; tFillEnd = NaN;
+Pnom = 2.5; P0 = 0.3; Ptrip = 4.5;                    % bar: hose loss at rated flow, static, trip limit
+kHose = (Pnom - P0)/flowRate^2;                       % hose + nozzle loss coefficient
+obstacle = [];                              % [x0 x1 y0 y1 z0 z1] world box
+poseRef = [0 0 0]; watchOn = false; driftOn = false;      % vehicle motion monitor
+driftSpeed = 0.03; driftLimit = 0.015; yawLimit = deg2rad(1);   % creep speed (m/s), trip limits (m, rad)
+cycleNo = 0; cycleTot = 0;
+tBuf = []; qaBuf = zeros(0,3); qrBuf = zeros(0,3); trackOn = false;
+plan = {};
+samples = zeros(40,3); trueInl = [0 0 0];
+
+%% ===================== figure =====================
+if ~isempty(P.Figure) && ishghandle(P.Figure)
+    fig = P.Figure; clf(fig);
+else
+    fig = figure('Name','Robotic Fuel Station - Workflow','NumberTitle','off', ...
+        'Color','w','Units','pixels','Position',[20 40 1520 900]);
+end
+if ~isempty(P.Header)
+    annotation(fig,'textbox',[0.30 0.972 0.69 0.026],'String',P.Header,'EdgeColor','none','FontWeight','bold', ...
+        'FontSize',10.5,'Color',[0.1 0.2 0.5],'Interpreter','none','VerticalAlignment','middle');
+end
+
+% ---------- flowchart ----------
+cIdle = [0.93 0.93 0.93]; cAct = [1.00 0.85 0.20]; cDone = [0.62 0.90 0.62];
+cFault = [1.00 0.45 0.45]; cWarn = [1.00 0.70 0.35];
+cEdge = [0.50 0.50 0.50]; cLit = [0.10 0.40 0.90];
+axF = axes('Parent',fig,'Position',[0.005 0.02 0.28 0.96]);
+hold(axF,'on'); axis(axF,'off'); xlim(axF,[0 11]); ylim(axF,[1.2 22.9]); daspect(axF,[1 1 1]);
+
+nodeDef = { ...
+ 'arrive','VEHICLE ARRIVES','term',5.5,22.0,3.4,0.62
+ 'detect','Vehicle detection','proc',5.5,21.0,4.4,0.62
+ 'position','Vehicle positioning','proc',5.5,20.0,4.4,0.62
+ 'safe','Is position safe?','dec',5.5,18.7,3.8,1.5
+ 'reposition','Reposition','proc',1.25,18.7,2.1,0.62
+ 'inlet','Detect fuel inlet','proc',5.5,17.2,4.4,0.62
+ 'flap','Check fuel flap','proc',5.5,16.2,4.4,0.62
+ 'target','Calculate target','proc',5.5,15.2,4.4,0.62
+ 'ik','Inverse Kinematics','proc',5.5,14.2,4.4,0.62
+ 'coll','Collision Checking','proc',5.5,13.2,4.4,0.62
+ 'traj','Trajectory Planning','proc',5.5,12.2,4.4,0.62
+ 'dyn','Dynamics + Controller','proc',5.5,11.2,4.4,0.62
+ 'move','Move Robot','proc',5.5,10.2,4.4,0.62
+ 'align','Alignment','proc',5.5,9.2,4.4,0.62
+ 'insert','Nozzle Insertion','proc',5.5,8.2,4.4,0.62
+ 'dispense','Fuel Dispensing','proc',5.5,7.2,4.4,0.62
+ 'normal','Normal operation','proc',3.0,6.0,3.4,0.62
+ 'fault','Fault detected','proc',8.1,6.0,3.0,0.62
+ 'stop','Stop at target','proc',3.0,5.0,3.4,0.62
+ 'emerg','Emergency stop','proc',8.1,5.0,3.0,0.62
+ 'remove','Remove nozzle','proc',3.0,4.0,3.4,0.62
+ 'fueloff','Fuel OFF','proc',8.1,4.0,3.0,0.62
+ 'home','Return Home','proc',3.0,3.0,3.4,0.62
+ 'complete','COMPLETE','term',3.0,2.0,3.0,0.62 };
+
+nodes = struct();
+for i = 1:size(nodeDef,1)
+    k = nodeDef{i,1}; cx = nodeDef{i,4}; cy = nodeDef{i,5}; w = nodeDef{i,6}; h = nodeDef{i,7};
+    switch nodeDef{i,3}
+        case 'term'
+            hb = rectangle('Parent',axF,'Position',[cx-w/2 cy-h/2 w h],'Curvature',[1 1], ...
+                'FaceColor',cIdle,'EdgeColor',[0.3 0.3 0.3],'LineWidth',1.2);
+        case 'proc'
+            hb = rectangle('Parent',axF,'Position',[cx-w/2 cy-h/2 w h], ...
+                'FaceColor',cIdle,'EdgeColor',[0.3 0.3 0.3],'LineWidth',1.2);
+        otherwise
+            hb = patch('Parent',axF,'XData',[cx cx+w/2 cx cx-w/2],'YData',[cy+h/2 cy cy-h/2 cy], ...
+                'FaceColor',cIdle,'EdgeColor',[0.3 0.3 0.3],'LineWidth',1.2);
+    end
+    text(cx,cy,nodeDef{i,2},'Parent',axF,'HorizontalAlignment','center', ...
+        'FontSize',8.5,'FontWeight','bold','Interpreter','none');
+    nodes.(k) = struct('hnd',hb,'cx',cx,'cy',cy,'w',w,'h',h,'label',nodeDef{i,2});
+end
+
+nb = @(k) [nodes.(k).cx, nodes.(k).cy - nodes.(k).h/2];
+nt = @(k) [nodes.(k).cx, nodes.(k).cy + nodes.(k).h/2];
+nl = @(k) [nodes.(k).cx - nodes.(k).w/2, nodes.(k).cy];
+nr = @(k) [nodes.(k).cx + nodes.(k).w/2, nodes.(k).cy];
+vert = @(a,b) {a, b, [nb(a); nt(b)]};
+yb = 6.6;                                   % y of the branch bar
+edgeDef = { ...
+ vert('arrive','detect'), vert('detect','position'), vert('position','safe'), ...
+ {'safe','inlet',[nb('safe'); nt('inlet')]}, ...
+ {'safe','reposition',[nl('safe'); nr('reposition')]}, ...
+ {'reposition','position',[nt('reposition'); nodes.reposition.cx nodes.position.cy; nl('position')]}, ...
+ vert('inlet','flap'), vert('flap','target'), vert('target','ik'), vert('ik','coll'), ...
+ vert('coll','traj'), vert('traj','dyn'), vert('dyn','move'), vert('move','align'), ...
+ vert('align','insert'), vert('insert','dispense'), ...
+ {'dispense','normal',[nb('dispense'); nodes.dispense.cx yb; nodes.normal.cx yb; nt('normal')]}, ...
+ {'dispense','fault', [nb('dispense'); nodes.dispense.cx yb; nodes.fault.cx yb;  nt('fault')]}, ...
+ vert('normal','stop'), vert('stop','remove'), vert('remove','home'), vert('home','complete'), ...
+ vert('fault','emerg'), vert('emerg','fueloff') };
+E = struct('id',{},'ln',{},'hd',{});
+for i = 1:numel(edgeDef)
+    d = edgeDef{i}; xy = d{3};
+    ln = plot(axF,xy(:,1),xy(:,2),'-','Color',cEdge,'LineWidth',1.3);
+    hd = arrowHead(axF,xy(end-1,1),xy(end-1,2),xy(end,1),xy(end,2),cEdge);
+    E(end+1) = struct('id',[d{1} '>' d{2}],'ln',ln,'hd',hd); %#ok<AGROW>
+end
+text(3.4,18.95,'NO','Parent',axF,'FontSize',9,'FontWeight','bold','Color',[0.7 0 0]);
+text(5.65,17.72,'YES','Parent',axF,'FontSize',9,'FontWeight','bold','Color',[0 0.5 0]);
+hCycle = text(7.9,13.7,'','Parent',axF,'FontSize',8.5,'Color',cLit,'FontAngle','italic', ...
+    'VerticalAlignment','middle','Interpreter','none');
+
+% ---------- 3D scene ----------
+axS = axes('Parent',fig,'Position',[0.30 0.33 0.69 0.65]); hold(axS,'on'); grid(axS,'on');
+xl = [min(-0.6, ideal(1)+V.ext(1)-0.4), max(2.6, ideal(1)+V.ext(2)+0.4)];
+yl = [-0.8, ideal(2)+V.ext(4)+0.5];
+zl = [0, max(2.3, V.ext(6)+0.3)];
+xlim(axS,xl); ylim(axS,yl); zlim(axS,zl); daspect(axS,[1 1 1]); view(axS,[-38 24]);
+xlabel(axS,'x along bay (m)'); ylabel(axS,'y toward vehicle (m)'); zlabel(axS,'z (m)');
+patch('Parent',axS,'XData',xl([1 2 2 1]),'YData',yl([1 1 2 2]),'ZData',[0 0 0 0], ...
+    'FaceColor',[0.94 0.94 0.94],'EdgeColor','none');
+plot3(axS,[0 2.3],[0 0],[z0 z0],'k-','LineWidth',5);
+plot3(axS,[0 0],[0 0],[0 z0],'k-','LineWidth',4);
+plot3(axS,[2.3 2.3],[0 0],[0 z0],'k-','LineWidth',4);
+hBay = plot3(axS,NaN,NaN,NaN,'--','Color',[0.2 0.6 0.2],'LineWidth',1.5);
+hBBox = plot3(axS,NaN,NaN,NaN,'-','Color',[0 0.6 0.9],'LineWidth',2);
+hRefBox = plot3(axS,NaN,NaN,NaN,'--','Color',[0.8 0 0.8],'LineWidth',1.5);
+hRule = gobjects(1,3); hRuleTxt = gobjects(1,3);
+for zi = 1:3
+    hRule(zi) = plot3(axS,NaN,NaN,NaN,'-','LineWidth',7);
+    hRuleTxt(zi) = text(0,0,0,'','Parent',axS,'FontSize',9,'FontWeight','bold','HorizontalAlignment','center');
+end
+hRuleMk = plot3(axS,NaN,NaN,NaN,'v','MarkerSize',12,'MarkerFaceColor','k','MarkerEdgeColor','k');
+
+faces = [1 2 3 4; 5 6 7 8; 1 2 6 5; 2 3 7 6; 3 4 8 7; 4 1 5 8];
+nBox = size(V.boxes,1); hBox = gobjects(1,nBox);
+for i = 1:nBox
+    hBox(i) = patch('Parent',axS,'Vertices',boxWorld(V.boxes(i,1:6),pose),'Faces',faces, ...
+        'FaceColor',V.boxes(i,7:9),'FaceAlpha',0.55,'EdgeColor',[0.3 0.3 0.3]);
+end
+hFlap = patch('Parent',axS,'Vertices',zeros(4,3),'Faces',[1 2 3 4], ...
+    'FaceColor',[0.1 0.2 0.5],'EdgeColor','k','Visible','off');
+hNeck = plot3(axS,NaN,NaN,NaN,'o','MarkerSize',8,'MarkerFaceColor','k','MarkerEdgeColor','k');
+hCap  = plot3(axS,NaN,NaN,NaN,'o','MarkerSize',9,'MarkerFaceColor',[0.35 0.35 0.35],'MarkerEdgeColor','k');
+hTick = plot3(axS,NaN,NaN,NaN,'-','Color','y','LineWidth',2);
+
+hCarr = patch('Parent',axS,'Vertices',boxWorld([-0.12 0.12 -0.1 0.1 -0.12 0.12],[0 0 0]) + repmat([0 0 z0],8,1), ...
+    'Faces',faces,'FaceColor',[0.3 0.3 0.35],'EdgeColor','k');
+hTray = patch('Parent',axS,'Vertices',zeros(8,3),'Faces',faces,'FaceColor',[0.75 0.75 0.4],'EdgeColor','k');
+hArm  = plot3(axS,NaN,NaN,NaN,'-','Color',[0.90 0.50 0.10],'LineWidth',7);
+hJnt  = plot3(axS,NaN,NaN,NaN,'o','MarkerSize',9,'MarkerFaceColor','k','MarkerEdgeColor','k');
+hTip  = plot3(axS,NaN,NaN,NaN,'o','MarkerSize',11,'MarkerFaceColor',toolCol(1,:),'MarkerEdgeColor','k');
+if fuelReq == 1, nozCol = [0.10 0.70 0.20]; else, nozCol = [0.12 0.12 0.12]; end
+hNoz  = plot3(axS,NaN,NaN,NaN,'-','Color',nozCol,'LineWidth',6);
+hHose = plot3(axS,NaN,NaN,NaN,'-','Color',nozCol,'LineWidth',2);
+hFlow = plot3(axS,NaN,NaN,NaN,'-','Color',[0 0.6 1],'LineWidth',7);
+
+hRays = gobjects(1,14);
+for i = 1:14, hRays(i) = plot3(axS,NaN,NaN,NaN,'-','Color',[0.95 0.5 0.5],'LineWidth',1); end
+hEst   = plot3(axS,NaN,NaN,NaN,'+','Color','r','MarkerSize',16,'LineWidth',2);
+hGhost = plot3(axS,NaN,NaN,NaN,':','Color',[0.4 0.4 0.4],'LineWidth',3);
+hPath  = plot3(axS,NaN,NaN,NaN,'--','Color',[0.8 0 0.8],'LineWidth',1.5);
+hWP    = plot3(axS,NaN,NaN,NaN,'p','Color',[0.8 0 0.8],'MarkerFaceColor',[0.8 0 0.8],'MarkerSize',9);
+hCok   = plot3(axS,NaN,NaN,NaN,'o','MarkerFaceColor',[0.2 0.8 0.2],'MarkerEdgeColor','k','MarkerSize',5,'LineStyle','none');
+hCbad  = plot3(axS,NaN,NaN,NaN,'o','MarkerFaceColor',[0.9 0.1 0.1],'MarkerEdgeColor','k','MarkerSize',6,'LineStyle','none');
+hRet   = plot3(axS,NaN,NaN,NaN,'-','Color',[0 0.7 0],'LineWidth',2);
+hObs   = patch('Parent',axS,'Vertices',zeros(8,3),'Faces',faces,'FaceColor',[0.9 0.2 0.2],'FaceAlpha',0.5,'Visible','off');
+hLit   = text(0,0,0,'','Parent',axS,'FontSize',11,'FontWeight','bold','Color',[0 0.3 0.8]);
+hWPtxt = gobjects(0);
+
+axB = axes('Parent',fig,'Position',[0.30 0.33 0.69 0.65],'Color','none','XColor','none','YColor','none', ...
+    'HitTest','off'); xlim(axB,[0 1]); ylim(axB,[0 1]); axis(axB,'off');
+hBanner = text(0.5,0.93,'','Parent',axB,'HorizontalAlignment','center','FontSize',20, ...
+    'FontWeight','bold','Color',[0.8 0 0]);
+
+% ---------- controller tracking plot ----------
+axT = axes('Parent',fig,'Position',[0.315 0.065 0.17 0.2]); hold(axT,'on'); grid(axT,'on');
+title(axT,'Joint control: ref (dashed) vs actual','FontSize',8);
+xlabel(axT,'time (s)'); ylabel(axT,'rail x (m) / angles (rad)');
+tc = [0 0.45 0.74; 0.85 0.33 0.10; 0.47 0.67 0.19];
+hQa = gobjects(1,3); hQr = gobjects(1,3);
+for i = 1:3
+    hQr(i) = plot(axT,NaN,NaN,'--','Color',tc(i,:),'LineWidth',1);
+    hQa(i) = plot(axT,NaN,NaN,'-','Color',tc(i,:),'LineWidth',1.8);
+end
+legend(axT,hQa,{'rail x','shoulder','elbow'},'FontSize',6,'Location','best');
+
+% ---------- fuel line pressure plot ----------
+axP = axes('Parent',fig,'Position',[0.51 0.065 0.13 0.2]); hold(axP,'on'); grid(axP,'on');
+title(axP,'Fuel line pressure','FontSize',8); xlabel(axP,'time (s)'); ylabel(axP,'bar');
+hPp = plot(axP,NaN,NaN,'-','Color',[0.85 0.1 0.1],'LineWidth',1.8);
+hPe = plot(axP,NaN,NaN,'--','Color',[0.5 0.5 0.5],'LineWidth',1);
+hPl = plot(axP,[0 12],[Ptrip Ptrip],'--k','LineWidth',1);
+ylim(axP,[0 6]); xlim(axP,[0 12]);
+legend(axP,[hPp hPe hPl],{'measured','expected','trip'},'FontSize',6,'Location','northwest');
+
+% ---------- status panel ----------
+axI = axes('Parent',fig,'Position',[0.65 0.045 0.34 0.215],'Box','on','XTick',[],'YTick',[]);
+xlim(axI,[0 1]); ylim(axI,[0 1]); hold(axI,'on');
+tBlock = text(0.02,0.88,'','Parent',axI,'FontSize',13,'FontWeight','bold','Color',[0.1 0.3 0.7],'Interpreter','none');
+tTask  = text(0.02,0.72,'','Parent',axI,'FontSize',10,'Interpreter','none');
+tInfo  = text(0.02,0.58,'','Parent',axI,'FontSize',9,'Interpreter','none','VerticalAlignment','top');
+tVeh   = text(0.02,0.32,'','Parent',axI,'FontSize',9,'Color',[0.3 0.3 0.3],'Interpreter','none');
+rectangle('Parent',axI,'Position',[0.02 0.07 0.62 0.12],'EdgeColor','k');
+hGauge = rectangle('Parent',axI,'Position',[0.02 0.07 0.0001 0.12],'FaceColor',[0 0.6 1],'EdgeColor','none');
+tLit   = text(0.66,0.13,'','Parent',axI,'FontSize',11,'FontWeight','bold','Interpreter','none');
+tValve = text(0.02,0.22,'','Parent',axI,'FontSize',9,'Interpreter','none');
+tMon   = text(0.02,0.03,'','Parent',axI,'FontSize',8,'Interpreter','none');
+uicontrol('Parent',fig,'Style','pushbutton','String','EMERGENCY STOP','FontWeight','bold', ...
+    'FontSize',11,'ForegroundColor','w','BackgroundColor',[0.80 0.10 0.10],'Units','normalized', ...
+    'Position',[0.855 0.268 0.13 0.045],'Callback',@(~,~) pressEstop());
+
+%% ===================== run the workflow =====================
+try
+    runWorkflow();
+catch ME
+    if strcmp(ME.identifier,'WF:closed'), return; end
+    if strncmp(ME.identifier,'WF:fault',8)
+        faultMsg = ME.message;
+        fprintf('\nFAULT DETECTED: %s\n', ME.message);
+        if ~isempty(strfind(ME.message,'WRONG FUEL')) && strcmp(detName,'car')
+            fprintf('(Tip: the simulator''s arriving car takes petrol unless you pass ''CarEngine'',''diesel''.)\n');
+        end
+        try
+            faultPath(ME.message);
+        catch ME2
+            if ~strcmp(ME2.identifier,'WF:closed'), rethrow(ME2); else, wasClosed = true; end
+        end
+    else
+        rethrow(ME);
+    end
+end
+fprintf('\nFinished: detected %s, requested %s, dispensed %.1f L, simulated time %.0f s.\n', ...
+    detTitle, fuelNames{fuelReq}, litres, simT);
+if detCls > 0
+    if strcmpi(detName, V.title), verdict = 'CORRECT'; else, verdict = 'WRONG'; end
+    fprintf('Vehicle type detection: inlet at %.0f%% of the body from the rear (%s) -> %s. Vehicle that arrived: %s -> %s.\n', ...
+        100*detFrac, detZone, detTitle, V.title, verdict);
+end
+if ~isnan(detErrShow)
+    fprintf('Inlet detection error: %.2f mm (limit %.1f mm).\n', detErrShow, P.MaxDetectError);
+end
+if ~isnan(tFillStart)
+    if isnan(tFillEnd), tFillEnd = simT; end
+    fprintf('Fill time: %.1f s for %.1f L (average %.2f L/s).\n', tFillEnd-tFillStart, litres, litres/max(tFillEnd-tFillStart,eps));
+end
+if ~isempty(pBuf), fprintf('Peak fuel-line pressure: %.2f bar (trip limit %.1f bar).\n', max(pBuf), Ptrip); end
+if isnan(tFillStart), fillTime = 0; else, fillTime = tFillEnd - tFillStart; end
+res = struct('closed',wasClosed,'litres',litres,'simT',simT,'detCls',detCls,'detName',detName,'detFrac',detFrac, ...
+    'detZone',detZone,'detErr',detErrShow,'faultMsg',faultMsg,'peak',peakP,'fillTime',fillTime, ...
+    'nRepark',nRepark,'nReplan',nReplan,'motion',motionLog,'tFillStart',tFillStart,'tFillEnd',tFillEnd);
+
+%% ###########################################################################
+%%                           NESTED FUNCTIONS
+%% ###########################################################################
+
+    function runWorkflow()
+        % ---------------- VEHICLE ARRIVES ----------------
+        enter('arrive','');
+        infoMsg = 'Vehicle entering the fuelling bay';
+        waitSim(4.5, @(f) driveIn(f));
+        leave('arrive');
+
+        % ---------------- Vehicle detection ----------------
+        enter('detect','arrive');
+        infoMsg = 'LiDAR + camera sweep: finding the vehicle outline and heading';
+        waitSim(3.0, @(f) sweepRays(f));
+        showBBox();
+        [sR0, sF0] = lidarEnds();
+        infoMsg = sprintf('Vehicle outline found: length %.1f m. Type not known yet (read from the inlet position)', sF0 - sR0);
+        waitSim(0.8, []);
+        setRays(0); leave('detect');
+
+        % ---------------- positioning / safety loop ----------------
+        prev = 'detect';
+        while true
+            enter('position',prev);
+            showBay();
+            infoMsg = 'Measuring heading and near-side gap (safe zone = green dashes)';
+            waitSim(1.5, []);
+            Cg = bodyCorners(V,pose);
+            gapM = min(Cg(:,2)) + 0.005*randn;
+            yawDeg = rad2deg(pose(3) + deg2rad(0.4)*randn);
+            infoMsg = sprintf('Near-side gap %.0f mm (safe 200-1100) | heading error %+.1f deg (limit 3)', gapM*1e3, yawDeg);
+            waitSim(1.0, []);
+            leave('position');
+            enter('safe','position');
+            waitSim(1.0, []);
+            if abs(yawDeg) <= 3 && gapM >= 0.20 && gapM <= 1.10
+                infoMsg = 'Position SAFE (heading within 3 deg, gap inside the safe zone)';
+                leave('safe');
+                break;
+            end
+            setNode('safe','warn');
+            infoMsg = 'Position NOT safe -> driver guidance / reposition'; nRepark = nRepark + 1;
+            enter('reposition','safe');
+            from = pose; to = repark;
+            advice = {};
+            if abs(yawDeg) > 3, advice{end+1} = sprintf('straighten %.1f deg', abs(yawDeg)); end %#ok<AGROW>
+            if gapM > 1.10, advice{end+1} = 'move closer to the pump'; elseif gapM < 0.20, advice{end+1} = 'move away from the pump'; end %#ok<AGROW>
+            banner(['PLEASE ' strjoin(advice,' and ')], [0.85 0.4 0]);
+            waitSim(4.5, @(f) moveVeh(from,to,f));
+            banner('');
+            leave('reposition');
+            setNode('position','idle'); setNode('safe','idle');
+            prev = 'reposition';
+        end
+
+        % ---------------- Detect fuel inlet ----------------
+        enter('inlet','safe');
+        trueInl = [pose(1) pose(2) ideal(3)];
+        if P.Calibrated
+            biasUsed = 0.0002*randn(1,3);          % residual camera bias after the fiducial calibration check
+            infoMsg = 'Camera calibration check on the carriage fiducial: bias removed';
+        else
+            biasUsed = calibBias;                  % camera calibration error NOT removed
+            infoMsg = 'WARNING: camera not calibrated - its bias remains';
+        end
+        waitSim(1.2, []);
+        sigma1 = P.CameraNoise/1000;               % per-axis noise of one camera frame (m)
+        roundEnds = [60 120 240]; samples = zeros(240,3); nF = 0; detErr = NaN; accepted = false;
+        for rd = 1:3
+            while nF < roundEnds(rd)
+                nF = nF + 1;
+                samples(nF,:) = trueInl + biasUsed + sigma1*randn(1,3);
+                est.inlet = mean(samples(1:nF,:),1);
+                detErr = norm(est.inlet - trueInl);
+                set(hEst,'XData',est.inlet(1),'YData',est.inlet(2),'ZData',est.inlet(3));
+                infoMsg = sprintf('Round %d, frame %d: detected error = %.2f mm  (must be < %.1f mm)', ...
+                    rd, nF, detErr*1e3, P.MaxDetectError);
+                tick();
+            end
+            if detErr*1e3 < P.MaxDetectError, accepted = true; break; end
+            infoMsg = sprintf('Error %.2f mm is not below %.1f mm -> averaging more frames', detErr*1e3, P.MaxDetectError);
+            waitSim(0.6, []);
+        end
+        detErrShow = detErr*1e3;
+        if ~accepted
+            banner(sprintf('INLET DETECTION ERROR %.2f mm (limit %.1f mm): INLET NOT OPENED', detErrShow, P.MaxDetectError), [0.8 0 0]);
+            fprintf('Inlet detection: error %.2f mm is NOT below %.1f mm after %d frames -> REJECTED, inlet not opened.\n', ...
+                detErrShow, P.MaxDetectError, nF);
+            error('WF:fault','%s',sprintf('Inlet detection error %.2f mm is not below %.1f mm: inlet NOT opened', ...
+                detErrShow, P.MaxDetectError));
+        end
+        fprintf('Inlet detection: error %.2f mm (limit %.1f mm), %d frames -> ACCEPTED, the inlet may be opened.\n', ...
+            detErrShow, P.MaxDetectError, nF);
+        banner(sprintf('INLET DETECTION ERROR %.2f mm (< %.1f mm): OK, inlet may be opened', detErrShow, P.MaxDetectError), [0 0.5 0]);
+        infoMsg = sprintf('Inlet located: detected error %.2f mm < %.1f mm after %d frames', detErrShow, P.MaxDetectError, nF);
+        waitSim(1.6, []);
+        banner('');
+
+        % --- vehicle type from where the inlet sits along the body (rear / middle / front)
+        [sRearM, sFrontM, hdg, yawEst] = lidarEnds();
+        sInlet = est.inlet(1:2)*hdg';
+        detFrac = (sInlet - sRearM)/(sFrontM - sRearM);
+        [detCls, detZone] = classifyVehicle(detFrac);
+        detList = {'car','lorry','bike'};
+        detName = detList{detCls};
+        Vd = vehicleDef(detName,1); Vd.fuel = NaN;
+        detTitle = Vd.title;
+        targetLitres = min(P.Litres, Vd.tank); flowRate = Vd.flow; kHose = (Pnom - P0)/flowRate^2;
+        drawRuler(sRearM, sFrontM, sInlet, hdg, est.inlet);
+        infoMsg = sprintf('Inlet is at %.0f%% of the body length from the rear (%s) -> %s', 100*detFrac, detZone, detTitle);
+        banner(['VEHICLE DETECTED: ' detTitle '  (inlet at the ' upper(detZone) ')'], [0 0.35 0.8]);
+        fprintf('Vehicle type: inlet at %.0f%% of the body from the rear (%s) -> %s.\n', 100*detFrac, detZone, detTitle);
+        waitSim(2.5, []);
+        banner(''); clearRuler();
+        if strcmp(Vd.dirType,'top'), est.dir = [0 0 -1]; else, est.dir = [-sin(yawEst) cos(yawEst) 0]; end
+        poseRef = pose; watchOn = true; showRefBox();      % arm the vehicle motion monitor
+
+        % --- fuel label (OCR) must match what the customer asked for
+        labelFuel = V.fuel;
+        infoMsg = sprintf('Fuel label read: %s | customer asked: %s', fuelNames{labelFuel}, fuelNames{fuelReq});
+        waitSim(1.2, []);
+        if labelFuel ~= fuelReq
+            error('WF:fault','%s',sprintf('WRONG FUEL: vehicle needs %s, customer chose %s', ...
+                fuelNames{labelFuel}, fuelNames{fuelReq}));
+        end
+        leave('inlet');
+
+        % ---------------- Check fuel flap ----------------
+        enter('flap','inlet');
+        switch Vd.flap
+            case 'push',   infoMsg = 'Flap: CLOSED, push-to-open type -> robot must press it';
+            case 'remote', infoMsg = 'Flap: LOCKED, remote-unlock type -> send unlock signal';
+            otherwise,     infoMsg = 'No flap: cap is directly accessible';
+        end
+        waitSim(1.8, []);
+        leave('flap');
+
+        % ---------------- Calculate target ----------------
+        enter('target','flap');
+        infoMsg = 'Computing waypoints and tool sequence from the inlet estimate';
+        buildPlan();
+        cycleTot = sum(cellfun(@(s) strcmp(s.kind,'move'), plan));
+        waitSim(2.0, []);
+        leave('target');
+
+        % ---------------- IK -> Collision -> Trajectory -> Dynamics -> Move (per waypoint) ----------------
+        prevNode = 'target';
+        for pIdx = 1:numel(plan)
+            s = plan{pIdx};
+            if strcmp(s.kind,'act')
+                performAction(s);
+            else
+                pipelineMove(s, prevNode);
+                prevNode = 'move';
+            end
+        end
+        clearPlanGraphics();
+
+        % ---------------- Alignment ----------------
+        enter('align','move');
+        dT = inletDir(V,pose); inlT = [pose(1) pose(2) ideal(3)];
+        ndirGoal = dT;
+        setRet(inlT, dT, true);
+        for it = 1:6
+            tp = fk3(q); e = inlT - tp; eLat = e - dot(e,dT)*dT; aErr = norm(eLat);
+            infoMsg = sprintf('Wrist camera: lateral error %.1f mm (iteration %d)', aErr*1e3, it);
+            taskMsg = 'Visual servoing onto the inlet axis';
+            if aErr < 0.002, break; end
+            runLeg(tp, tp + 0.8*eLat, 0.2);
+        end
+        waitSim(0.6, []);
+        setRet(inlT, dT, false);
+        infoMsg = sprintf('Aligned to %.1f mm - nozzle axis matches inlet axis', aErr*1e3);
+        leave('align');
+
+        % ---------------- Nozzle Insertion ----------------
+        enter('insert','align');
+        taskMsg = 'Inserting nozzle with compliance';
+        infoMsg = 'Pushing nozzle into the filler neck (8 cm)';
+        runLeg(fk3(q), inlT + 0.08*dT, 0.12);
+        e = inlT - fk3(q); eLat = e - dot(e,dT)*dT;
+        if norm(eLat) > 0.012
+            error('WF:fault','%s','Nozzle jammed: misaligned with the filler neck');
+        end
+        seated = true; valveOpen = true;
+        infoMsg = 'Nozzle seated - interlock closed, valve armed';
+        waitSim(0.8, []);
+        leave('insert');
+
+        % ---------------- Fuel Dispensing ----------------
+        enter('dispense','insert');
+        taskMsg = sprintf('Dispensing %s: target %.1f L, rated %.1f L/s', fuelNames{fuelReq}, targetLitres, flowRate);
+        flowing = true; pTrack = true; pBuf = []; tpBuf = []; pExpBuf = [];
+        valveU = 0; flowQ = 0; qInt = 0; tD = 0; faultT0 = NaN; tFillStart = simT;
+        % pressure/flow schedule depends on the fraction of the requested quantity already pumped
+        tankFullCase = P.Litres >= Vd.tank;
+        while targetLitres - litres > 0.01
+            tD = tD + dt;
+            % flow set-point: quick start (0.8 s), full flow, then taper over the last 15 % of the quantity
+            frac = litres/targetLitres;
+            tpr = min(1, max(0, (frac - 0.85)/0.14)); taperS = tpr*tpr*(3 - 2*tpr);
+            Qt = flowRate*min(1, tD/0.8)*(1 - 0.85*taperS);
+            % PI flow controller with feed-forward, valve actuator lag 0.5 s
+            eQ = (Qt - flowQ)/flowRate;
+            qInt = max(-1, min(1, qInt + eQ*dt));
+            uCmd = min(1, max(0, Qt/flowRate + 0.8*eQ + 1.5*qInt));
+            valveU = valveU + (uCmd - valveU)*dt/0.5;
+            flowQ = valveU*flowRate;
+            litres = min(targetLitres, litres + flowQ*dt);
+            if strcmp(moveMode,'fuelling') && litres >= 0.3*targetLitres, driftOn = true; end
+            % line pressure: P = P0 + b*k*Q^2  (b = blockage factor; a leak lowers the reading)
+            blk = 1; lk = 0;
+            if litres >= 0.4*targetLitres && ~strcmp(faultMode,'none')
+                if isnan(faultT0), faultT0 = tD; end
+                ramp = min(1, (tD - faultT0)/1.5);
+                if strcmp(faultMode,'overpressure'), blk = 1 + 2.5*ramp; end
+                if strcmp(faultMode,'leak'), lk = ramp; end
+            end
+            surge = 0.6*(1 - exp(-tD/0.15))*exp(-tD/1.5);   % start-up pressure surge (peaks at the start)
+            head  = 0.8*(1 - frac);                          % pump head: pressure falls as the quantity pumped grows
+            pExp  = P0 + kHose*flowQ^2 + surge + head;
+            pLine = P0 + blk*kHose*flowQ^2*(1 - 0.6*lk) + surge + head + 0.02*randn;
+            peakP = max(peakP, pLine);
+            if frac < 0.85, phaseTxt = 'peak then gradual decline'; else, phaseTxt = 'tapering: pressure falling'; end
+            tpBuf(end+1) = simT; pBuf(end+1) = pLine; pExpBuf(end+1) = pExp; %#ok<AGROW>
+            if numel(tpBuf) > 400, tpBuf = tpBuf(end-399:end); pBuf = pBuf(end-399:end); pExpBuf = pExpBuf(end-399:end); end
+            infoMsg = sprintf('Pumping %s: %.1f / %.1f L | %.2f L/s | %.2f bar | %s', fuelNames{fuelReq}, litres, targetLitres, flowQ, pLine, phaseTxt);
+            % protection logic
+            if pLine > Ptrip
+                tick();
+                error('WF:fault','%s',sprintf('OVER-PRESSURE %.1f bar (limit %.1f): nozzle or hose blocked', pLine, Ptrip));
+            end
+            if flowQ > 0.3*flowRate && pLine < 0.7*pExp
+                tick();
+                error('WF:fault','%s','LEAK: line pressure fell below the expected value for this flow');
+            end
+            tick();
+        end
+        litres = targetLitres;
+        if tankFullCase
+            infoMsg = 'Tank full: back-pressure spike -> nozzle auto shut-off';
+            for kq = 1:20
+                flowQ = flowQ*0.6; valveU = flowQ/flowRate;
+                pLine = P0 + 2.8*exp(-(kq-6)^2/12) + 0.02*randn; pExp = P0;
+                tpBuf(end+1) = simT; pBuf(end+1) = pLine; pExpBuf(end+1) = pExp; %#ok<AGROW>
+                tick();
+            end
+        end
+        flowing = false; flowQ = 0; pTrack = false; tFillEnd = simT;
+        leave('dispense');
+
+        % ---------------- Normal operation ----------------
+        enter('normal','dispense');
+        infoMsg = 'Target reached - no faults detected';
+        waitSim(0.8, []);
+        leave('normal');
+
+        enter('stop','normal');
+        valveOpen = false; valve0 = valveU;
+        infoMsg = sprintf('Valve closing smoothly - flow stopped at %.1f L', litres);
+        waitSim(1.2, @(f) setValve(valve0*(1-f)));
+        pLine = 0;
+        leave('stop');
+
+        enter('remove','stop');
+        postSequence();
+        leave('remove');
+
+        enter('home','remove');
+        taskMsg = 'Arm returning to its home position'; infoMsg = 'Moving home';
+        ndirGoal = [0 1 0]; tool = 0;
+        runLeg(fk3(q), homePos, 0.5);
+        leave('home');
+
+        enter('complete','home');
+        infoMsg = sprintf('Fuelling complete: %.1f L of %s dispensed. Vehicle may leave.', litres, fuelNames{fuelReq});
+        banner('COMPLETE', [0 0.55 0]);
+        waitSim(1.0, []);
+        watchOn = false; driftOn = false; set(hRefBox,'XData',NaN,'YData',NaN,'ZData',NaN);
+        from = pose; to = [pose(1)+9, pose(2), 0];
+        waitSim(5.0, @(f) moveVeh(from,to,f));
+        leave('complete');
+    end
+
+    % ------------------------------------------------------------------
+    function faultPath(msg)
+        if ~isnan(tFillStart) && isnan(tFillEnd), tFillEnd = simT; end
+        driftOn = false; inFault = true; flowing = false; valveOpen = false; flowQ = 0; valveU = 0; pLine = 0; pTrack = false;
+        if ~isempty(curNode), setNode(curNode,'fault'); end
+        if strcmp(curNode,'dispense'), litEdge('dispense','fault'); end
+        setNode('fault','fault');
+        infoMsg = ['FAULT: ' msg]; taskMsg = 'Fault detected';
+        banner('FAULT DETECTED', [0.8 0 0]);
+        waitSim(1.5, []);
+        litEdge('fault','emerg'); setNode('emerg','fault'); stBlock = 'Emergency stop';
+        infoMsg = 'EMERGENCY STOP: all motion frozen, pump stopped';
+        banner('EMERGENCY STOP', [0.8 0 0]);
+        waitSim(2.5, @(f) blink(f));
+        litEdge('emerg','fueloff'); setNode('fueloff','fault'); stBlock = 'Fuel OFF';
+        infoMsg = 'FUEL OFF: pump stopped, valve closed. Attendant required.';
+        waitSim(2.0, []);
+    end
+
+    % ------------------------------------------------------------------
+    function pipelineMove(s, prevNode)
+        cycleNo = cycleNo + 1;
+        for kk = {'ik','coll','traj','dyn','move'}, setNode(kk{1},'idle'); end
+        set(hCycle,'String',sprintf('waypoint %d / %d\n%s', cycleNo, cycleTot, s.label));
+        taskMsg = sprintf('Waypoint %d/%d: %s', cycleNo, cycleTot, s.label);
+        p1 = s.pos; p0 = fk3(q);
+        tool = s.tool;
+        if tool >= 1, ndirGoal = est.dir; end
+
+        % --- Inverse Kinematics
+        enter('ik',prevNode);
+        [qg,ok] = ik3(p1);
+        if ~ok, error('WF:fault','%s','IK: target out of reach of the arm'); end
+        infoMsg = sprintf('IK: rail x=%.2f m, shoulder=%.0f deg, elbow=%.0f deg', qg(1), rad2deg(qg(2)), rad2deg(qg(3)));
+        waitSim(0.6, @(f) ghostArm(qg,f));
+        leave('ik');
+
+        % --- Collision Checking (with replanning)
+        enter('coll','ik');
+        pts = [p0; p1];
+        [hit, S] = pathCollides(pts);
+        waitSim(0.7, @(f) showSamples(S,f));
+        if hit
+            infoMsg = 'COLLISION predicted on the straight path -> replanning with a via-point';
+            nReplan = nReplan + 1; setNode('coll','warn'); waitSim(0.8, []);
+            found = false;
+            mid = (p0+p1)/2;
+            cand = [0 0 0.25; 0 -0.2 0.25; 0 -0.25 -0.2];
+            for c = 1:size(cand,1)
+                via = mid + cand(c,:);
+                [h1,S1] = pathCollides([p0; via; p1]);
+                if ~h1
+                    pts = [p0; via; p1]; S = S1; found = true; break;
+                end
+            end
+            if ~found, error('WF:fault','%s','No collision-free path found'); end
+            waitSim(0.7, @(f) showSamples(S,f));
+            infoMsg = 'Collision-free path found';
+        else
+            infoMsg = 'Path is collision-free (all swept samples clear of vehicle and obstacles)';
+        end
+        leave('coll');
+
+        % --- Trajectory Planning
+        enter('traj','coll');
+        set(hPath,'XData',pts(:,1),'YData',pts(:,2),'ZData',pts(:,3));
+        len = sum(sqrt(sum(diff(pts,1,1).^2,2)));
+        infoMsg = sprintf('Minimum-jerk trajectory: %.2f m path, peak speed 0.35 m/s', len);
+        waitSim(0.7, []);
+        leave('traj');
+
+        % --- Dynamics + Controller
+        enter('dyn','traj');
+        infoMsg = sprintf('Joint PD controller: Kp=%d, Kd=%d  (wn = 10 rad/s, zeta = 0.75)', Kp, Kd);
+        trackOn = true; tBuf = []; qaBuf = zeros(0,3); qrBuf = zeros(0,3);
+        waitSim(0.5, []);
+        leave('dyn');
+
+        % --- Move Robot
+        enter('move','dyn');
+        if strcmp(moveMode,'approach') && cycleNo == 1, driftOn = true; end
+        infoMsg = 'Arm following the planned trajectory';
+        for j = 1:size(pts,1)-1
+            runLeg(pts(j,:), pts(j+1,:), 0.35);
+        end
+        leave('move');
+        set(hGhost,'XData',NaN,'YData',NaN,'ZData',NaN);
+        set(hCok,'XData',NaN,'YData',NaN,'ZData',NaN);
+        set(hCbad,'XData',NaN,'YData',NaN,'ZData',NaN);
+        set(hPath,'XData',NaN,'YData',NaN,'ZData',NaN);
+    end
+
+    % ------------------------------------------------------------------
+    function runLeg(p0, p1, vmax)
+        dist = norm(p1 - p0);
+        T = max(0.6, 1.875*dist/vmax);
+        n = ceil(T/dt);
+        for k = 1:n
+            tau = k/n; sj = 10*tau^3 - 15*tau^4 + 6*tau^5;
+            stepDyn(p0 + sj*(p1-p0));
+            tick();
+        end
+        for k = 1:60
+            stepDyn(p1);
+            if norm(fk3(q) - p1) < 0.001 && norm(qd) < 0.02, break; end
+            tick();
+        end
+    end
+
+    function stepDyn(pref)
+        [qr,ok] = ik3(pref);
+        if ~ok, error('WF:fault','%s','Target out of reach of the arm'); end
+        for sub = 1:2
+            acc = Kp*(qr - q) - Kd*qd;
+            qd = qd + acc*(dt/2);
+            q  = q + qd*(dt/2);
+        end
+        lastAcc = acc;
+        qRef = qr;
+        ndir = ndir + 0.15*(ndirGoal - ndir);
+        ndir = ndir/norm(ndir);
+        if trackOn
+            tBuf(end+1,1) = simT; qaBuf(end+1,:) = q; qrBuf(end+1,:) = qRef; %#ok<AGROW>
+            if numel(tBuf) > 300
+                tBuf = tBuf(end-299:end); qaBuf = qaBuf(end-299:end,:); qrBuf = qrBuf(end-299:end,:);
+            end
+        end
+    end
+
+    function quick(p)
+        runLeg(fk3(q), p, 0.5);
+    end
+
+    % ------------------------------------------------------------------
+    function buildPlan()
+        d = est.dir; inl = est.inlet; st = inl - 0.15*d; tray = [inl(1) 0.35 0.9];
+        pl = {}; lastPos = [];
+        switch Vd.flap
+            case 'push'
+                pl{end+1} = mv('Approach flap', st, 0);
+                pl{end+1} = mv('Press flap', inl + 0.01*d, 1);
+                pl{end+1} = ac('Flap springs open', 'flapOpen');
+                pl{end+1} = mv('Retreat from flap', st, 0); lastPos = st;
+            case 'remote'
+                pl{end+1} = ac('Remote unlock sent', 'remoteUnlock');
+        end
+        if isempty(lastPos), pl{end+1} = mv('Approach cap', st, 2); end
+        pl{end+1} = mv('Grip cap', inl + 0.02*d, 2);
+        pl{end+1} = ac('Unscrew cap (2 turns)', 'unscrew');
+        pl{end+1} = mv('Stow cap in tray', tray, 2);
+        pl{end+1} = ac('Release cap in tray', 'release');
+        pl{end+1} = mv('Approach with nozzle', st, 3);
+        plan = pl;
+        % optional obstacle on the first leg
+        if P.Obstacle
+            first = plan{find(cellfun(@(s) strcmp(s.kind,'move'), plan),1)};
+            m = (homePos + first.pos)/2;
+            obstacle = [m(1)-0.07 m(1)+0.07 m(2)-0.07 m(2)+0.07 m(3)-0.07 m(3)+0.07];
+            set(hObs,'Vertices',boxWorld(obstacle,[0 0 0]),'Visible','on');
+        end
+        % show numbered waypoints
+        mvIdx = find(cellfun(@(s) strcmp(s.kind,'move'), plan));
+        mp = zeros(numel(mvIdx),3);
+        for jj = 1:numel(mvIdx), mp(jj,:) = plan{mvIdx(jj)}.pos; end
+        set(hWP,'XData',mp(:,1),'YData',mp(:,2),'ZData',mp(:,3));
+        for jj = 1:size(mp,1)
+            hWPtxt(end+1) = text(mp(jj,1),mp(jj,2),mp(jj,3)+0.07,num2str(jj),'Parent',axS, ...
+                'FontSize',9,'Color',[0.6 0 0.6],'FontWeight','bold'); %#ok<AGROW>
+        end
+    end
+
+    function performAction(s)
+        taskMsg = s.label;
+        switch s.act
+            case 'flapOpen'
+                infoMsg = 'Flap released by the spring latch';
+                waitSim(1.2, @(f) setFlap(1.75*f));
+            case 'remoteUnlock'
+                infoMsg = 'Wireless unlock command -> vehicle opens the flap';
+                waitSim(0.8, []);
+                waitSim(1.2, @(f) setFlap(1.75*f));
+            case 'unscrew'
+                capState = 2;
+                infoMsg = 'Gripper turns the cap anticlockwise 2 turns';
+                waitSim(3.0, @(f) setWrist(4*pi*f));
+            case 'release'
+                capState = 3; tool = 0;
+                infoMsg = 'Cap parked in the carriage tray';
+                waitSim(0.8, []);
+        end
+    end
+
+    function postSequence()
+        dd = inletDir(V,pose); inl = [pose(1) pose(2) ideal(3)];
+        st = inl - 0.15*dd; tray = [inl(1) 0.35 0.9];
+        ndirGoal = dd; tool = 3;
+        taskMsg = 'Withdrawing the nozzle'; infoMsg = 'Nozzle leaving the filler neck';
+        showHose = true; seated = false;
+        quick(st);
+        taskMsg = 'Holstering the nozzle'; infoMsg = 'Nozzle returned to its holder';
+        quick(tray); tool = 0; waitSim(0.6, []);
+        taskMsg = 'Refitting the cap'; infoMsg = 'Picking the cap from the tray';
+        tool = 2; capState = 2; waitSim(0.6, []);
+        quick(st); quick(inl + 0.02*dd);
+        infoMsg = 'Screwing the cap back on (2 turns)';
+        waitSim(3.0, @(f) setWrist(4*pi*(1-f)));
+        capState = 1; wrist = 0; tool = 0; waitSim(0.5, []);
+        quick(st);
+        switch Vd.flap
+            case 'push'
+                taskMsg = 'Closing the flap'; tool = 1; infoMsg = 'Pressing the flap shut';
+                quick(inl + 0.01*dd);
+                waitSim(1.0, @(f) setFlap(1.75*(1-f)));
+                tool = 0; quick(st);
+            case 'remote'
+                taskMsg = 'Closing the flap'; infoMsg = 'Wireless lock command -> flap closes';
+                waitSim(1.2, @(f) setFlap(1.75*(1-f)));
+        end
+        showHose = false;
+    end
+
+    % ------------------------------------------------------------------
+    function [hit, S] = pathCollides(pts)
+        hit = false; S = zeros(0,4);   % [x y z flag]
+        for j = 1:size(pts,1)-1
+            for a = linspace(0,1,12)
+                p = pts(j,:) + a*(pts(j+1,:)-pts(j,:));
+                [qq,ok] = ik3(p);
+                if ok, bad = linkInCollision(qq); else, bad = true; end
+                if bad, hit = true; end
+                S(end+1,:) = [p, double(bad)]; %#ok<AGROW>
+            end
+        end
+    end
+
+    function bad = linkInCollision(qq)
+        base = [qq(1) 0 z0]; el = [qq(1) L1*cos(qq(2)) z0+L1*sin(qq(2))]; tp = fk3(qq);
+        bad = false;
+        for a = linspace(0,1,7)
+            for pnt = {base + a*(el-base), el + a*(tp-el)}
+                pp = pnt{1};
+                if norm(pp - est.inlet) < 0.25, continue; end      % docking zone
+                if pointHitsVehicle(pp) || pointInBox(pp,obstacle,0.03)
+                    bad = true; return;
+                end
+            end
+        end
+    end
+
+    function hit = pointHitsVehicle(pp)
+        c = cos(pose(3)); s = sin(pose(3));
+        lx =  (pp(1)-pose(1))*c + (pp(2)-pose(2))*s;
+        ly = -(pp(1)-pose(1))*s + (pp(2)-pose(2))*c;
+        hit = false;
+        for b = 1:nBox
+            bx = V.boxes(b,1:6); m = 0.03;
+            if lx>=bx(1)-m && lx<=bx(2)+m && ly>=bx(3)-m && ly<=bx(4)+m && pp(3)>=bx(5)-m && pp(3)<=bx(6)+m
+                hit = true; return;
+            end
+        end
+    end
+
+    % ------------------------------------------------------------------
+    %  graphics helpers
+    function enter(key, from)
+        if ~isempty(from), litEdge(from,key); end
+        setNode(key,'active'); curNode = key; stBlock = nodes.(key).label;
+    end
+    function leave(key), setNode(key,'done'); end
+
+    function setNode(key, st)
+        switch st
+            case 'active', c = cAct;
+            case 'done',   c = cDone;
+            case 'fault',  c = cFault;
+            case 'warn',   c = cWarn;
+            otherwise,     c = cIdle;
+        end
+        set(nodes.(key).hnd,'FaceColor',c);
+    end
+
+    function litEdge(a, b)
+        idx = find(strcmp({E.id},[a '>' b]),1);
+        if isempty(idx), return; end
+        set(E(idx).ln,'Color',cLit,'LineWidth',2.6);
+        set(E(idx).hd,'FaceColor',cLit,'EdgeColor',cLit);
+    end
+
+    function banner(txt, col)
+        if nargin < 2, col = [0.8 0 0]; end
+        set(hBanner,'String',txt,'Color',col);
+    end
+
+    function pressEstop()
+        estopReq = true;
+    end
+
+    function driveIn(f)
+        sm = f*f*(3-2*f);
+        pose = [park(1) - 8*(1-sm), park(2), park(3)*max(0,(f-0.6)/0.4)];
+    end
+
+    function moveVeh(from, to, f)
+        sm = f*f*(3-2*f);
+        pose = from + sm*(to - from);
+    end
+
+    function sweepRays(f)
+        setRays(f);
+    end
+
+    function setRays(f)
+        n = numel(hRays);
+        if f <= 0
+            for i = 1:n, set(hRays(i),'XData',NaN,'YData',NaN,'ZData',NaN); end
+            return;
+        end
+        sensor = [1.0, -0.6, 2.3];
+        k = max(1, round(f*n));
+        xs = linspace(V.ext(1), V.ext(2), n);
+        for i = 1:n
+            if i <= k
+                [wx,wy] = l2w(pose, xs(i), V.ext(3));
+                set(hRays(i),'XData',[sensor(1) wx],'YData',[sensor(2) wy],'ZData',[sensor(3) 0.6]);
+            else
+                set(hRays(i),'XData',NaN,'YData',NaN,'ZData',NaN);
+            end
+        end
+    end
+
+    function showBBox()
+        cx = [V.ext(1) V.ext(2) V.ext(2) V.ext(1) V.ext(1)];
+        cy = [V.ext(3) V.ext(3) V.ext(4) V.ext(4) V.ext(3)];
+        wx = zeros(1,5); wy = zeros(1,5);
+        for i = 1:5, [wx(i),wy(i)] = l2w(pose,cx(i),cy(i)); end
+        set(hBBox,'XData',wx,'YData',wy,'ZData',0.02*ones(1,5));
+    end
+
+    function [sRearM, sFrontM, hdg, yawM] = lidarEnds()
+        % LiDAR: vehicle ends along its measured heading (front = direction of travel)
+        yawM = pose(3) + deg2rad(0.4)*randn;
+        hdg = [cos(yawM) sin(yawM)];
+        Cl = bodyCorners(V,pose);
+        spl = Cl*hdg';
+        sRearM = min(spl) + 0.02*randn;
+        sFrontM = max(spl) + 0.02*randn;
+    end
+
+    function drawRuler(sRearM, sFrontM, sInlet, hdg, inl)
+        nrm = [-hdg(2) hdg(1)];
+        edges = [0 0.35 0.65 1.0]; zc = [0.95 0.55 0.10; 0.20 0.70 0.30; 0.10 0.40 0.90];
+        zn = {'REAR = car','MIDDLE = lorry','FRONT = bike'};
+        for zi = 1:3
+            sa = sRearM + edges(zi)*(sFrontM - sRearM); sb = sRearM + edges(zi+1)*(sFrontM - sRearM);
+            pa = inl(1:2) + (sa - sInlet)*hdg - 0.35*nrm;
+            pb = inl(1:2) + (sb - sInlet)*hdg - 0.35*nrm;
+            set(hRule(zi),'XData',[pa(1) pb(1)],'YData',[pa(2) pb(2)],'ZData',[0.05 0.05],'Color',zc(zi,:));
+            pm = (pa + pb)/2;
+            set(hRuleTxt(zi),'Position',[pm(1) pm(2) 0.18],'String',zn{zi},'Color',zc(zi,:)*0.8);
+        end
+        pk = inl(1:2) - 0.35*nrm;
+        set(hRuleMk,'XData',pk(1),'YData',pk(2),'ZData',0.16);
+    end
+
+    function clearRuler()
+        for zi = 1:3
+            set(hRule(zi),'XData',NaN,'YData',NaN,'ZData',NaN);
+            set(hRuleTxt(zi),'String','');
+        end
+        set(hRuleMk,'XData',NaN,'YData',NaN,'ZData',NaN);
+    end
+
+    function showRefBox()
+        cx = [V.ext(1) V.ext(2) V.ext(2) V.ext(1) V.ext(1)];
+        cy = [V.ext(3) V.ext(3) V.ext(4) V.ext(4) V.ext(3)];
+        wx = zeros(1,5); wy = zeros(1,5);
+        for ib = 1:5, [wx(ib),wy(ib)] = l2w(poseRef,cx(ib),cy(ib)); end
+        set(hRefBox,'XData',wx,'YData',wy,'ZData',0.04*ones(1,5));
+    end
+
+    function showBay()
+        xr = [xl(1) xl(2) xl(2) xl(1) xl(1)]; yr = [0.20 0.20 1.10 1.10 0.20];
+        set(hBay,'XData',xr,'YData',yr,'ZData',0.03*ones(1,5));
+    end
+
+    function camFrames(f)
+        i = max(1, min(40, round(f*40)));
+        samples(i,:) = trueInl + calibBias + 0.006*randn(1,3);
+        m = mean(samples(1:i,:),1);
+        set(hEst,'XData',m(1),'YData',m(2),'ZData',m(3));
+    end
+
+    function ghostArm(qg, ~)
+        b = [qg(1) 0 z0]; el = [qg(1) L1*cos(qg(2)) z0+L1*sin(qg(2))]; tp = fk3(qg);
+        set(hGhost,'XData',[b(1) el(1) tp(1)],'YData',[b(2) el(2) tp(2)],'ZData',[b(3) el(3) tp(3)]);
+    end
+
+    function showSamples(S, f)
+        n = max(1, round(f*size(S,1)));
+        A = S(1:n,:);
+        g = A(A(:,4)==0,:); r = A(A(:,4)==1,:);
+        if isempty(g), g = [NaN NaN NaN NaN]; end
+        if isempty(r), r = [NaN NaN NaN NaN]; end
+        set(hCok,'XData',g(:,1),'YData',g(:,2),'ZData',g(:,3));
+        set(hCbad,'XData',r(:,1),'YData',r(:,2),'ZData',r(:,3));
+    end
+
+    function setRet(c, d, on)
+        if ~on, set(hRet,'XData',NaN,'YData',NaN,'ZData',NaN); return; end
+        a = [0 0 1]; if abs(dot(a,d)) > 0.9, a = [1 0 0]; end
+        u = cross(d,a); u = u/norm(u); v = cross(d,u);
+        th = linspace(0,2*pi,40);
+        C = c + 0.025*(cos(th)'*u + sin(th)'*v);
+        set(hRet,'XData',C(:,1),'YData',C(:,2),'ZData',C(:,3));
+    end
+
+    function setValve(u), valveU = u; flowQ = u*flowRate; end
+    function setFlap(a), flapAng = a; end
+    function setWrist(a), wrist = a; end
+
+    function blink(f)
+        if mod(floor(f*8),2) == 0, banner('EMERGENCY STOP',[0.8 0 0]); else, banner('',[0.8 0 0]); end
+    end
+
+    function clearPlanGraphics()
+        set(hWP,'XData',NaN,'YData',NaN,'ZData',NaN);
+        for j = 1:numel(hWPtxt), if ishghandle(hWPtxt(j)), delete(hWPtxt(j)); end, end
+        hWPtxt = gobjects(0);
+        set(hCycle,'String','');
+        set(hObs,'Visible','off'); obstacle = [];
+        trackOn = false;
+    end
+
+    % ------------------------------------------------------------------
+    function waitSim(dur, fcn)
+        nw = max(1, round(dur/dt));
+        for iw = 1:nw
+            if ~isempty(fcn), fcn(iw/nw); end
+            tick();
+        end
+    end
+
+    function tick()
+        simT = simT + dt;
+        if driftOn, pose(1) = pose(1) + driftSpeed*dt; end     % vehicle creeping forward
+        motionLog(end+1,:) = [simT, q, qd, lastAcc, fk3(q), pose(1)]; %#ok<AGROW>   % motion record for the graphs
+        refresh();
+        el = toc(tClock);
+        w = dt/P.Speed - el;
+        if w > 0.001, pause(w); end
+        tClock = tic;
+    end
+
+    function refresh()
+        if ~ishghandle(fig), error('WF:closed','closed'); end
+        if estopReq && ~inFault, error('WF:fault','%s','EMERGENCY STOP button pressed'); end
+        % vehicle motion monitor
+        if watchOn
+            dPosM = norm(pose(1:2) - poseRef(1:2)); dYawM = abs(pose(3) - poseRef(3));
+            tripped = dPosM > driftLimit || dYawM > yawLimit;
+            if tripped && ~inFault
+                set(tMon,'String','Vehicle motion monitor: TRIPPED','Color',[0.8 0 0]);
+                error('WF:fault','%s',sprintf('VEHICLE MOVED %.0f mm (limit %.0f mm): motion monitor tripped', dPosM*1e3, driftLimit*1e3));
+            end
+            if tripped, monCol = [0.8 0 0]; monState = 'TRIPPED';
+            elseif dPosM > 0.5*driftLimit, monCol = [0.9 0.5 0]; monState = 'VEHICLE MOVING';
+            else, monCol = [0 0.5 0]; monState = 'OK'; end
+            set(tMon,'String',sprintf('Vehicle motion monitor: %s  (%.0f mm, %.1f deg from reference)', ...
+                monState, dPosM*1e3, rad2deg(dYawM)),'Color',monCol);
+        else
+            set(tMon,'String','Vehicle motion monitor: armed once the inlet is located','Color',[0.4 0.4 0.4]);
+        end
+        frameCount = frameCount + 1;
+        if mod(frameCount, P.FrameSkip) ~= 0, return; end      % draw only every FrameSkip-th step
+        % arm
+        base = [q(1) 0 z0]; el = [q(1) L1*cos(q(2)) z0+L1*sin(q(2))]; tp = fk3(q);
+        set(hArm,'XData',[base(1) el(1) tp(1)],'YData',[base(2) el(2) tp(2)],'ZData',[base(3) el(3) tp(3)]);
+        set(hJnt,'XData',[base(1) el(1)],'YData',[base(2) el(2)],'ZData',[base(3) el(3)]);
+        set(hTip,'XData',tp(1),'YData',tp(2),'ZData',tp(3),'MarkerFaceColor',toolCol(tool+1,:));
+        set(hCarr,'Vertices',boxWorld([-0.12 0.12 -0.1 0.1 -0.12 0.12],[q(1) 0 0]) + repmat([0 0 z0],8,1));
+        set(hTray,'Vertices',boxWorld([-0.08 0.08 -0.08 0.08 0 0.03],[q(1) 0.35 0]) + repmat([0 0 0.87],8,1));
+        % nozzle + hose
+        if tool == 3
+            nd = ndir/norm(ndir);
+            a = tp - 0.22*nd;
+            set(hNoz,'XData',[a(1) tp(1)],'YData',[a(2) tp(2)],'ZData',[a(3) tp(3)]);
+        else
+            set(hNoz,'XData',NaN,'YData',NaN,'ZData',NaN);
+        end
+        if tool == 3 || showHose
+            if tool == 3, pc = [q(1) 0.0 0.72]; pm = (pc+tp)/2 + [0 0 -0.35];
+                tt = linspace(0,1,16)'; H = (1-tt).^2*pc + 2*(1-tt).*tt*pm + tt.^2*tp;
+                set(hHose,'XData',H(:,1),'YData',H(:,2),'ZData',H(:,3));
+            else
+                set(hHose,'XData',NaN,'YData',NaN,'ZData',NaN);
+            end
+        else
+            set(hHose,'XData',NaN,'YData',NaN,'ZData',NaN);
+        end
+        if flowQ > 0.01*flowRate && seated
+            dd = inletDir(V,pose);
+            set(hFlow,'LineWidth',1+7*flowQ/flowRate,'XData',[tp(1) tp(1)+0.08*dd(1)],'YData',[tp(2) tp(2)+0.08*dd(2)],'ZData',[tp(3) tp(3)+0.08*dd(3)]);
+        else
+            set(hFlow,'XData',NaN,'YData',NaN,'ZData',NaN);
+        end
+        % vehicle
+        for b = 1:nBox, set(hBox(b),'Vertices',boxWorld(V.boxes(b,1:6),pose)); end
+        inlW = [pose(1) pose(2) ideal(3)]; dW = inletDir(V,pose);
+        if ~strcmp(V.flap,'none')
+            fv = flapVerts(pose, ideal(3), flapAng);
+            set(hFlap,'Vertices',fv,'Visible','on','FaceColor',[0.1 0.2 0.5]*(flapAng<0.3) + [0.9 0.5 0.1]*(flapAng>=0.3));
+        end
+        accessible = strcmp(V.flap,'none') || flapAng > 0.5;
+        if accessible && capState ~= 1
+            set(hNeck,'XData',inlW(1),'YData',inlW(2),'ZData',inlW(3));
+        else
+            set(hNeck,'XData',NaN,'YData',NaN,'ZData',NaN);
+        end
+        switch capState
+            case 1, cp = inlW + 0.015*dW;
+            case 2, cp = tp;
+            otherwise, cp = [q(1) 0.35 0.90];
+        end
+        if capState == 3, cp = cp + [0 0 0.03]; end
+        set(hCap,'XData',cp(1),'YData',cp(2),'ZData',cp(3));
+        a = [0 0 1]; if abs(dot(a,dW)) > 0.9, a = [1 0 0]; end
+        u = cross(dW,a); u = u/norm(u); v = cross(dW,u);
+        te = cp + 0.03*(cos(wrist)*u + sin(wrist)*v);
+        set(hTick,'XData',[cp(1) te(1)],'YData',[cp(2) te(2)],'ZData',[cp(3) te(3)]);
+        % litres label
+        if litres > 0
+            set(hLit,'Position',[pose(1), pose(2), V.ext(6)+0.25],'String',sprintf('%.1f L',litres));
+        end
+        % tracking plot
+        if trackOn && ~isempty(tBuf)
+            for i = 1:3
+                set(hQa(i),'XData',tBuf,'YData',qaBuf(:,i));
+                set(hQr(i),'XData',tBuf,'YData',qrBuf(:,i));
+            end
+            xlim(axT,[max(0,tBuf(end)-12), max(12,tBuf(end))]);
+        end
+        % pressure plot
+        if pTrack && ~isempty(tpBuf)
+            set(hPp,'XData',tpBuf,'YData',pBuf);
+            set(hPe,'XData',tpBuf,'YData',pExpBuf);
+            xl2 = [max(0,tpBuf(end)-12), max(12,tpBuf(end))];
+            xlim(axP,xl2); set(hPl,'XData',xl2,'YData',[Ptrip Ptrip]);
+        end
+        % status panel
+        set(tBlock,'String',stBlock);
+        set(tTask,'String',taskMsg);
+        set(tInfo,'String',infoMsg);
+        if isnan(detErrShow), errTxt = 'detect error: --'; else, errTxt = sprintf('detect error: %.2f mm', detErrShow); end
+        set(tVeh,'String',sprintf('%s | asked: %s | %s | t = %.1f s | tool: %s', ...
+            detTitle, fuelNames{fuelReq}, errTxt, simT, toolNames{tool+1}));
+        if isnan(tFillStart)
+            set(tLit,'String',sprintf('%.1f / %.1f L',litres,targetLitres));
+        else
+            if isnan(tFillEnd), elapsedT = simT - tFillStart; else, elapsedT = tFillEnd - tFillStart; end
+            set(tLit,'String',sprintf('%.1f/%.1f L  %.0f s',litres,targetLitres,elapsedT));
+        end
+        set(hGauge,'Position',[0.02 0.07 max(0.0001, 0.62*litres/targetLitres) 0.12]);
+        if valveU > 0.02
+            set(tValve,'String',sprintf('Valve %3.0f%% | flow %.2f L/s | line %.2f bar (trip %.1f)', ...
+                100*valveU, flowQ, pLine, Ptrip),'Color',[0 0.5 0]);
+        else
+            set(tValve,'String',sprintf('Valve CLOSED | line pressure %.2f bar', pLine),'Color',[0.7 0 0]);
+        end
+        drawnow;
+    end
+
+end
+
+%% ###########################################################################
+%%                           LOCAL HELPER FUNCTIONS
+%% ###########################################################################
+
+function V = vehicleDef(name, carEngine)
+% Local frame: origin at the fuel inlet, x along the vehicle, y into the vehicle, z up.
+% boxes = [x0 x1 y0 y1 z0 z1 r g b]
+switch name
+    case 'car'
+        V.title = 'CAR'; V.ideal = [1.00 0.90 0.85]; V.dirType = 'side'; V.flap = 'push';
+        V.tank = 45; V.flow = 0.8; V.fuel = carEngine;
+        V.boxes = [ -0.9 3.1 0 1.8 0.25 0.95  0.20 0.40 0.80
+                     0.6 2.4 0.1 1.7 0.95 1.45 0.70 0.82 0.95
+                    -0.5 -0.1 0.02 0.22 0 0.30 0.15 0.15 0.15
+                    -0.5 -0.1 1.58 1.78 0 0.30 0.15 0.15 0.15
+                     2.1 2.5 0.02 0.22 0 0.30 0.15 0.15 0.15
+                     2.1 2.5 1.58 1.78 0 0.30 0.15 0.15 0.15 ];
+    case 'lorry'
+        V.title = 'LORRY'; V.ideal = [1.70 1.05 0.95]; V.dirType = 'side'; V.flap = 'remote';
+        V.tank = 300; V.flow = 1.7; V.fuel = 2;
+        V.boxes = [ -4.2 3.6 0 2.5 0.45 1.2 0.35 0.35 0.38
+                    -4.2 1.9 0 2.5 1.20 3.0 0.85 0.85 0.88
+                     2.0 3.6 0 2.5 1.20 2.9 0.80 0.25 0.20
+                    -3.2 -2.4 -0.05 0.25 0 0.75 0.12 0.12 0.12
+                     1.0 1.8 -0.05 0.25 0 0.75 0.12 0.12 0.12
+                    -3.2 -2.4 2.25 2.55 0 0.75 0.12 0.12 0.12
+                     1.0 1.8 2.25 2.55 0 0.75 0.12 0.12 0.12 ];
+    otherwise
+        V.title = 'BIKE'; V.ideal = [0.55 0.65 0.95]; V.dirType = 'top'; V.flap = 'none';
+        V.tank = 12; V.flow = 0.3; V.fuel = 1;
+        % x runs rear (-1.5) to front (+0.5): the tank cap sits at 75 % of the length, i.e. in the FRONT part
+        V.boxes = [ -1.2 0.2 -0.06 0.06 0.30 0.50 0.25 0.25 0.25
+                    -0.35 0.35 -0.17 0.17 0.50 0.93 0.85 0.15 0.15
+                    -1.2 -0.35 -0.12 0.12 0.62 0.72 0.10 0.10 0.10
+                    -0.1 0.5 -0.05 0.05 0 0.60 0.10 0.10 0.10
+                    -1.5 -0.9 -0.05 0.05 0 0.60 0.10 0.10 0.10
+                    0.15 0.25 -0.35 0.35 0.95 1.00 0.10 0.10 0.10 ];
+end
+b = V.boxes;
+V.ext = [min(b(:,1)) max(b(:,2)) min(b(:,3)) max(b(:,4)) min(b(:,5)) max(b(:,6))];
+end
+
+function [q,ok] = ik3(p)
+L1 = 0.65; L2 = 0.65; z0 = 0.6;
+py = p(2); dz = p(3) - z0;
+D = (py^2 + dz^2 - L1^2 - L2^2) / (2*L1*L2);
+ok = abs(D) <= 1 && py >= 0 && p(1) >= 0 && p(1) <= 2.3;
+D = max(-1, min(1, D));
+q3 = -acos(D);
+q2 = atan2(dz,py) - atan2(L2*sin(q3), L1 + L2*cos(q3));
+q = [p(1) q2 q3];
+end
+
+function tip = fk3(q)
+L1 = 0.65; L2 = 0.65; z0 = 0.6;
+tip = [q(1), L1*cos(q(2)) + L2*cos(q(2)+q(3)), z0 + L1*sin(q(2)) + L2*sin(q(2)+q(3))];
+end
+
+function d = inletDir(V, pose)
+if strcmp(V.dirType,'top'), d = [0 0 -1]; else, d = [-sin(pose(3)) cos(pose(3)) 0]; end
+end
+
+function [wx,wy] = l2w(pose, lx, ly)
+wx = pose(1) + lx*cos(pose(3)) - ly*sin(pose(3));
+wy = pose(2) + lx*sin(pose(3)) + ly*cos(pose(3));
+end
+
+function Vw = boxWorld(b, pose)
+% b = [x0 x1 y0 y1 z0 z1] in the vehicle frame, pose = [x y yaw]
+x0=b(1); x1=b(2); y0=b(3); y1=b(4); z0=b(5); z1=b(6);
+C = [x0 y0 z0; x1 y0 z0; x1 y1 z0; x0 y1 z0; x0 y0 z1; x1 y0 z1; x1 y1 z1; x0 y1 z1];
+c = cos(pose(3)); s = sin(pose(3));
+Vw = [pose(1) + C(:,1)*c - C(:,2)*s, pose(2) + C(:,1)*s + C(:,2)*c, C(:,3)];
+end
+
+function Fv = flapVerts(pose, zc, a)
+% flap on the vehicle side face (y = 0), hinged at its rear edge
+P = [-0.12 0 zc-0.1; -0.12+0.24*cos(a) -0.24*sin(a) zc-0.1; ...
+     -0.12+0.24*cos(a) -0.24*sin(a) zc+0.1; -0.12 0 zc+0.1];
+c = cos(pose(3)); s = sin(pose(3));
+Fv = [pose(1) + P(:,1)*c - P(:,2)*s, pose(2) + P(:,1)*s + P(:,2)*c, P(:,3)];
+end
+
+function hit = pointInBox(p, b, m)
+if isempty(b), hit = false; return; end
+hit = p(1)>=b(1)-m && p(1)<=b(2)+m && p(2)>=b(3)-m && p(2)<=b(4)+m && p(3)>=b(5)-m && p(3)<=b(6)+m;
+end
+
+function s = mv(label, pos, tool)
+s = struct('kind','move','label',label,'pos',pos,'tool',tool,'act','');
+end
+
+function s = ac(label, act)
+s = struct('kind','act','label',label,'pos',[0 0 0],'tool',0,'act',act);
+end
+
+function hp = arrowHead(ax, x1, y1, x2, y2, col)
+v = [x2-x1, y2-y1]; v = v/norm(v); n = [-v(2) v(1)]; s = 0.17;
+P1 = [x2 y2]; P2 = P1 - s*v + 0.45*s*n; P3 = P1 - s*v - 0.45*s*n;
+hp = patch('Parent',ax,'XData',[P1(1) P2(1) P3(1)],'YData',[P1(2) P2(2) P3(2)], ...
+    'FaceColor',col,'EdgeColor',col);
+end
+
+function [cls, zone] = classifyVehicle(f)
+% f = position of the fuel inlet along the body, 0 = rear end ... 1 = front end
+% rear = CAR, middle = LORRY, front = BIKE
+if f < 0.35
+    cls = 1; zone = 'rear';
+elseif f <= 0.65
+    cls = 2; zone = 'middle';
+else
+    cls = 3; zone = 'front';
+end
+end
+
+function C = bodyCorners(V, pose)
+% world x-y corners of every body box (used for the LiDAR outline)
+C = zeros(0,2);
+for b = 1:size(V.boxes,1)
+    Vw = boxWorld(V.boxes(b,1:6), pose);
+    C = [C; Vw(:,1:2)]; %#ok<AGROW>
+end
+end
+
+function classifyTest(N)
+% Headless test: how reliably is the vehicle type found from the inlet position?
+if nargin < 1 || isempty(N), N = 300; end
+rng(11); names = {'car','lorry','bike'}; conf = zeros(3,3); fr = cell(1,3);
+for n = 1:N
+    t = randi(3); Vt = vehicleDef(names{t},1);
+    pose = [Vt.ideal(1) + (rand*0.25 - 0.10), Vt.ideal(2) + (rand*0.35 - 0.10), deg2rad(rand*12 - 6)];
+    yawM = pose(3) + deg2rad(0.4)*randn; hh = [cos(yawM) sin(yawM)];
+    sp = bodyCorners(Vt,pose)*hh';
+    sRearM = min(sp) + 0.02*randn; sFrontM = max(sp) + 0.02*randn;
+    inl = pose(1:2) + 0.001*randn(1,2);                  % inlet after the < 1 mm detection gate
+    f = (inl*hh' - sRearM)/(sFrontM - sRearM);
+    c = classifyVehicle(f);
+    conf(t,c) = conf(t,c) + 1; fr{t}(end+1) = f; %#ok<AGROW>
+end
+fprintf('\nVehicle type from the inlet position (%d random arrivals, random parking and sensor noise)\n\n', N);
+fprintf('%-14s %8s %8s %8s   %-22s %s\n','arrived \ found','car','lorry','bike','inlet position (0=rear..1=front)','accuracy');
+for t = 1:3
+    if isempty(fr{t}), continue; end
+    fprintf('%-14s %8d %8d %8d   %.2f (%.2f .. %.2f)        %5.1f %%\n', names{t}, conf(t,:), ...
+        mean(fr{t}), min(fr{t}), max(fr{t}), 100*conf(t,t)/sum(conf(t,:)));
+end
+fprintf('\nDecision rule: position < 0.35 -> car (rear), 0.35..0.65 -> lorry (middle), > 0.65 -> bike (front).\nOverall accuracy: %.1f %%\n\n', 100*trace(conf)/sum(conf(:)));
+end
+
+%% ##########################################################################
+%%  PART 2: FILL TIME AND PRESSURE GRAPHS
+%% ##########################################################################
+function out = fill_time_pressure(varargin)
+% FILL_TIME_PRESSURE  How long does the tank take to fill, and what does the
+% fuel-line pressure do meanwhile?  (Same flow/pressure model as the workflow
+% animation, but runs instantly and draws the graphs. Plain MATLAB, no toolboxes.)
+%
+%   fill_time_pressure                                % car, lorry and bike, full tank
+%   fill_time_pressure('Vehicle','car','Litres',20)   % 20 L into the car
+%   fill_time_pressure('Vehicle','lorry','Fault','overpressure')
+%
+% OPTIONS
+%   'Vehicle'  'car' | 'lorry' | 'bike' | 'all'          (default 'all')
+%   'Litres'   litres to dispense (default = full tank, limited to the tank size)
+%   'Fault'    'none' | 'leak' | 'overpressure'          (default 'none')
+%
+% MODEL (same as the workflow animation)
+%   Pressure follows the QUANTITY pumped: maximum right after the pump starts (start-up
+%   surge), a gradual decline as the dispensed fraction grows, then a steep fall over
+%   the last 15 % of the requested litres while the flow tapers (gentle finish).
+%   P = P0 + k*Q^2 + surge(t) + head(fraction),  P0 = 0.3 bar
+%   Valve: PI + feed-forward flow control, actuator lag 0.5 s
+%   Protection: trip above 4.5 bar; leak if P < 70 % of expected for the flow
+
+ip = inputParser;
+addParameter(ip,'Vehicle','all');
+addParameter(ip,'Litres',[]);
+addParameter(ip,'Fault','none');
+parse(ip,varargin{:});
+Pa = ip.Results;
+faultMode = validatestring(lower(char(Pa.Fault)),{'none','leak','overpressure'});
+
+names = {'car','lorry','bike'};  tank = [45 300 12];  rated = [0.8 1.7 0.3];  % L, L, L/s
+if strcmpi(char(Pa.Vehicle),'all')
+    idx = 1:3;
+else
+    idx = find(strcmpi(char(Pa.Vehicle),names));
+    if isempty(idx), error('Vehicle must be car, lorry, bike or all.'); end
+end
+
+col = [0.00 0.45 0.74; 0.85 0.33 0.10; 0.47 0.67 0.19];
+Ptrip = 4.5; P0 = 0.3; Pnom = 2.5;
+figure('Name','Fill time and pressure','Color','w','Position',[80 60 1250 780]);
+ax1 = subplot(2,2,1); hold on; grid on; title('Volume dispensed vs time'); xlabel('time (s)'); ylabel('litres');
+ax2 = subplot(2,2,2); hold on; grid on; title('Flow vs time');             xlabel('time (s)'); ylabel('L/s');
+ax3 = subplot(2,2,3); hold on; grid on; title('Fuel-line pressure vs time'); xlabel('time (s)'); ylabel('pressure (bar)');
+ax4 = subplot(2,2,4); hold on; grid on; title('Pressure vs volume dispensed (% of requested)');          xlabel('% of requested litres'); ylabel('pressure (bar)');
+yline(ax3,Ptrip,'k--','trip limit 4.5 bar','LabelHorizontalAlignment','left');
+
+fprintf('\n%-7s %7s %10s %12s %14s %12s   %s\n','Vehicle','Litres','Rated L/s','V/Q only (s)','Model time (s)','Peak (bar)','Result');
+out = struct('vehicle',{},'litres',{},'fillTime',{},'peakBar',{},'status',{});
+leg = {};
+for n = idx
+    target = tank(n); if ~isempty(Pa.Litres), target = min(Pa.Litres, tank(n)); end
+    r = simulateFill(rated(n), target, faultMode, Pnom, P0, Ptrip);
+    c = col(n,:);
+    plot(ax1,r.t,r.V,'-','Color',c,'LineWidth',1.8);
+    plot(ax2,r.t,r.Q,'-','Color',c,'LineWidth',1.8);
+    plot(ax3,r.t,r.P,'-','Color',c,'LineWidth',1.4);
+    plot(ax3,r.t,r.Pexp,':','Color',c,'LineWidth',1);
+    plot(ax4,100*r.V/target,r.P,'-','Color',c,'LineWidth',1.4);
+    leg{end+1} = sprintf('%s (%.0f L, %.0f s)',names{n},target,r.tFill); %#ok<AGROW>
+    fprintf('%-7s %7.1f %10.2f %12.1f %14.1f %12.2f   %s\n',names{n},target,rated(n),target/rated(n),r.tFill,r.peak,r.status);
+    out(end+1) = struct('vehicle',names{n},'litres',target,'fillTime',r.tFill,'peakBar',r.peak,'status',r.status); %#ok<AGROW>
+end
+legend(ax1,leg,'Location','northwest'); legend(ax2,leg,'Location','best'); legend(ax3,leg,'Location','east');
+ylim(ax3,[0 max(6, 1.1*max([out.peakBar]))]);
+legend(ax4,leg,'Location','northwest');
+sgtitle(sprintf('Tank fill time and fuel-line pressure  (fault mode: %s)',faultMode));
+fprintf('\n');
+end
+
+function r = simulateFill(flowRate, target, mode, Pnom, P0, Ptrip)
+dt = 0.04; k = (Pnom - P0)/flowRate^2;
+rng(7);
+litres = 0; u = 0; Q = 0; qInt = 0; tD = 0; ft = NaN; status = 'normal';
+t = []; V = []; Qh = []; P = []; Pe = [];
+while target - litres > 0.01
+    tD = tD + dt;
+    frac = litres/target;
+    tpr = min(1, max(0, (frac - 0.85)/0.14)); taperS = tpr*tpr*(3 - 2*tpr);
+    Qt = flowRate*min(1, tD/0.8)*(1 - 0.85*taperS);        % quick start, full flow, taper at the end
+    e = (Qt - Q)/flowRate;
+    qInt = max(-1, min(1, qInt + e*dt));
+    uCmd = min(1, max(0, Qt/flowRate + 0.8*e + 1.5*qInt));
+    u = u + (uCmd - u)*dt/0.5;
+    Q = u*flowRate;
+    litres = min(target, litres + Q*dt);
+    blk = 1; lk = 0;
+    if litres >= 0.4*target && ~strcmp(mode,'none')
+        if isnan(ft), ft = tD; end
+        ramp = min(1,(tD-ft)/1.5);
+        if strcmp(mode,'overpressure'), blk = 1 + 2.5*ramp; end
+        if strcmp(mode,'leak'), lk = ramp; end
+    end
+    surge = 0.6*(1 - exp(-tD/0.15))*exp(-tD/1.5);          % start-up surge
+    head  = 0.8*(1 - frac);                                 % pressure falls as the quantity pumped grows
+    pExp = P0 + k*Q^2 + surge + head;
+    p = P0 + blk*k*Q^2*(1 - 0.6*lk) + surge + head + 0.02*randn;
+    t(end+1) = tD; V(end+1) = litres; Qh(end+1) = Q; P(end+1) = p; Pe(end+1) = pExp; %#ok<AGROW>
+    if p > Ptrip
+        status = sprintf('TRIPPED: over-pressure at %.1f s',tD); break;
+    end
+    if Q > 0.3*flowRate && p < 0.7*pExp
+        status = sprintf('TRIPPED: leak detected at %.1f s',tD); break;
+    end
+end
+r = struct('t',t,'V',V,'Q',Qh,'P',P,'Pexp',Pe,'tFill',tD,'peak',max(P),'status',status);
+end
+
+%% ##########################################################################
+%%  PART 3: MULTI-VEHICLE STATION SIMULATION + PETROL-BUNK OWNER'S EXCEL REPORT
+%% ##########################################################################
+function out = stationSimulation(varargin)
+% STATIONSIMULATION  A continuously running robotic fuel station that uses the ORIGINAL animated
+% workflow (flowchart + 3D robot + controller + pressure plot) for every vehicle. Random vehicles
+% (cars, lorries, bikes) keep arriving, queue for the single robot bay, and are served one after
+% the other in the same window - until the simulated run time is over, the vehicle limit is
+% reached, or you close the window. Then the full report is printed in the Command Window and
+% written to Excel.
+ip = inputParser;
+addParameter(ip,'RunMinutes',60);       % simulated run time in minutes in which vehicles arrive (Inf = until you close the window)
+addParameter(ip,'Vehicles',Inf);        % optional cap on the number of vehicles
+addParameter(ip,'Seed',[]);
+addParameter(ip,'Live',true);           % false = same simulation, no drawing (instant)
+addParameter(ip,'Speed',3);             % animation speed factor of the workflow (bigger = faster)
+addParameter(ip,'FrameSkip',1);         % draw only every Nth step (e.g. 5) for a faster animation
+addParameter(ip,'MeanGap',150);         % average seconds between arrivals
+addParameter(ip,'SaveGraphs',true);       % save velocity / position / acceleration graphs of every vehicle
+addParameter(ip,'GraphFolder','');       % folder for the graphs (default: Fuel_Station_Graphs_<date_time> in the current folder)
+addParameter(ip,'MaxLitres',10);         % largest fill requested by any vehicle (small = fast simulation)
+addParameter(ip,'PetrolPrice',105);
+addParameter(ip,'DieselPrice',92);
+addParameter(ip,'PetrolStock',3000);
+addParameter(ip,'DieselStock',4000);
+addParameter(ip,'WrongFuelChance',0.08);
+addParameter(ip,'FaultChance',0.15);
+addParameter(ip,'File','');
+addParameter(ip,'StationName','Robotic Fuel Station');
+parse(ip,varargin{:}); P = ip.Results;
+if isempty(P.Seed), rng('shuffle'); else, rng(P.Seed); end
+Dur = 60*P.RunMinutes; maxV = P.Vehicles;
+if ~P.Live && isinf(Dur) && isinf(maxV), Dur = 3600; fprintf('Live is off and no limit given: running 60 simulated minutes.\n'); end
+
+names = {'car','lorry','bike'}; fuelNames = {'petrol','diesel'};
+price = [P.PetrolPrice P.DieselPrice];
+catNames = {'Car (petrol)','Car (diesel)','Lorry (diesel)','Bike (petrol)'};
+outNames = {'Completed','Refused - wrong fuel','Refused - inlet detection error', ...
+            'Emergency stop - leak','Emergency stop - over-pressure','Emergency stop - vehicle moved','Emergency stop - other fault'};
+t0 = floor(now) + 8/24;                                  % shift starts 08:00
+fmt = @(s) datestr(t0 + s/86400,'HH:MM:SS');
+detLabel = @(c) ternary(c > 0, upper(names{max(c,1)}), 'N/A');
+
+% one window for the whole run (the workflow redraws into it for every vehicle)
+if P.Live
+    figH = figure('Name',P.StationName,'NumberTitle','off','Color','w','Units','pixels','Position',[20 40 1520 900]);
+    speed = P.Speed; skip = max(1, round(P.FrameSkip));
+else
+    figH = figure('Name',P.StationName,'NumberTitle','off','Color','w','Visible','off','Units','pixels','Position',[20 40 1520 900]);
+    speed = 1e6; skip = 1e9;
+end
+fprintf('\n--- %s: simulation running (arrivals for %s) ---\n', P.StationName, ...
+    ternary(isinf(Dur),'until you close the window',sprintf('%g simulated min',P.RunMinutes)));
+
+%% ---------------- run: vehicles keep arriving ----------------
+gdir = P.GraphFolder;
+if isempty(gdir), gdir = fullfile(pwd, ['Fuel_Station_Graphs_' datestr(now,'yyyymmdd_HHMMSS')]); end
+if P.SaveGraphs && ~exist(gdir,'dir'), mkdir(gdir); end
+R = []; pend = []; gen = 0; lastArr = -Inf; nextArr = rand*20; stopGen = false;
+bayFree = 0; busyTime = 0; stopNow = false;
+petrolL = 0; dieselL = 0; money = 0; served = 0; refused = 0; stopped = 0; catCount = zeros(1,4); n = 0;
+while ~stopNow
+    % make sure every vehicle that arrives before this one starts is known (for the queue count)
+    while ~stopGen && (isempty(pend) || lastArr <= max(bayFree, pend(1).arrive))
+        if gen >= maxV || nextArr > Dur, stopGen = true; break; end
+        gen = gen + 1;
+        pend = [pend, genVehicle(P, gen, nextArr)]; %#ok<AGROW>
+        lastArr = nextArr; nextArr = nextArr + (-log(rand))*P.MeanGap;
+    end
+    if isempty(pend), break; end
+    v = pend(1); pend(1) = []; n = n + 1;
+    tStart = max(v.arrive, bayFree);
+    nq = sum([pend.arrive] <= tStart);
+
+    % ---- run the ORIGINAL animated workflow for this vehicle ----
+    hdr = sprintf('%s  |  clock %s  |  vehicle %d: %s, asks %.0f L %s  |  waiting in queue: %d  |  served %d  refused %d  stopped %d  |  petrol %.0f L  diesel %.0f L  |  sales INR %s', ...
+        P.StationName, fmt(tStart), n, v.plate, v.want, fuelNames{v.custFuel}, nq, served, refused, stopped, petrolL, dieselL, addCommas(money));
+    fprintf('\n=== Vehicle %d (%s) arrives at %s ===\n', n, v.plate, fmt(v.arrive));
+    sv = rng;
+    res = robotic_fuel_station_workflow('Arrives',names{v.t},'CarEngine',fuelNames{v.eng},'Fuel',fuelNames{v.custFuel}, ...
+        'Litres',v.want,'UnsafeParking',v.unsafe,'Fault',v.fault,'Obstacle',v.obstacle,'VehicleMoves',v.moveMode, ...
+        'Calibrated',~v.calFail,'Speed',speed,'FrameSkip',skip,'NoiseSeed',v.noiseSeed,'Header',hdr,'Figure',figH);
+    rng(sv);                                             % the workflow reseeds the generator; keep our random stream
+    if res.closed, stopNow = true; n = n - 1; break; end
+
+    % ---- what happened ----
+    fm = res.faultMsg; remark = 'Normal fill';
+    if isempty(fm), oc = 1;
+    else
+        remark = fm;
+        if ~isempty(strfind(fm,'WRONG FUEL')), oc = 2;
+        elseif ~isempty(strfind(fm,'Inlet detection error')), oc = 3;
+        elseif ~isempty(strfind(fm,'LEAK')), oc = 4;
+        elseif ~isempty(strfind(fm,'OVER-PRESSURE')), oc = 5;
+        elseif ~isempty(strfind(fm,'VEHICLE MOVED')), oc = 6;
+        else, oc = 7;
+        end
+    end
+    litres = res.litres; tSvc = res.simT;
+    if res.nRepark > 0, remark = [remark '; repositioned (unsafe parking)']; end
+    if res.nReplan > 0, remark = [remark '; obstacle - path re-planned']; end
+    tEnd = tStart + tSvc; busyTime = busyTime + tSvc; bayFree = tEnd;
+    amount = round(litres*price(v.needFuel)*100)/100;
+    if litres <= 0.05, fuelDisp = 0; else, fuelDisp = v.needFuel; end
+    if fuelDisp == 1, petrolL = petrolL + litres; elseif fuelDisp == 2, dieselL = dieselL + litres; end
+    money = money + amount; catCount(v.cat) = catCount(v.cat) + 1;
+    if oc == 1, served = served + 1; elseif oc == 2 || oc == 3, refused = refused + 1; else, stopped = stopped + 1; end
+    v.oc = oc; v.tStart = tStart; v.tEnd = tEnd; v.wait = tStart - v.arrive; v.tSvc = tSvc;
+    v.litres = litres; v.amount = amount; v.peak = res.peak; v.tFill = res.fillTime; v.remark = remark;
+    v.fuelDisp = fuelDisp; v.det = res.detCls; v.f = res.detFrac; v.zone = res.detZone; v.detErr = res.detErr;
+    v.repark = res.nRepark > 0; v.replan = res.nReplan > 0;
+    v.motion = res.motion; v.tFS = res.tFillStart; v.tFE = res.tFillEnd;
+    if P.SaveGraphs, v.graph = saveMotionGraph(v, gdir, n, outNames{oc}); end      % graph of THIS vehicle, saved straight away
+    if n == 1, R = v; else, R(n) = v; end %#ok<AGROW>
+    fprintf('>>> %s %s  %-5s %-7s %-32s', fmt(tStart), v.id, upper(names{v.t}), fuelNames{v.custFuel}, outNames{oc});
+    if litres > 0.05, fprintf(' %6.1f L  INR %.2f', litres, amount); end
+    fprintf('  (waited %.0f s)\n', v.wait);
+end
+if stopNow, fprintf('\nWindow closed - simulation stopped, building the report for %d finished vehicle(s).\n', n); end
+N = n;
+if N == 0, fprintf('No vehicle finished - nothing to report.\n'); out = []; return; end
+
+%% ---------------- statistics ----------------
+shiftEnd = bayFree; firstArr = R(1).arrive;
+util = 100*busyTime/max(shiftEnd - firstArr, 1);
+
+%% ---------------- report tables ----------------
+oc_all = [R.oc]; lit = [R.litres]; amt = [R.amount]; cats = [R.cat]; fd_all = [R.fuelDisp];
+okMask = oc_all == 1; yn = {'No','Yes'};
+hdr = {'No','Vehicle ID','Registration','Arrival time','Service start','Service end','Wait (s)','Service time (s)', ...
+       'Vehicle type (arrived)','Detected as','Inlet position (0 rear - 1 front)','Detection error (mm)','Fuel the vehicle needs', ...
+       'Fuel selected by customer','Tank capacity (L)','Fuel level on arrival (%)','Litres requested','Litres dispensed', ...
+       'Rate (INR/L)','Amount (INR)','Peak line pressure (bar)','Fill time (s)','Repositioned','Obstacle re-plan','Outcome','Remarks'};
+T = cell(N+1, numel(hdr)); T(1,:) = hdr;
+for k = 1:N
+    v = R(k);
+    T(k+1,:) = {k, v.id, v.plate, fmt(v.arrive), fmt(v.tStart), fmt(v.tEnd), round(v.wait), round(v.tSvc), ...
+        upper(names{v.t}), detLabel(v.det), round(v.f*100)/100, round(v.detErr*100)/100, fuelNames{v.needFuel}, ...
+        fuelNames{v.custFuel}, v.V.tank, round(v.level), v.want, round(v.litres*10)/10, price(v.needFuel), v.amount, ...
+        round(v.peak*100)/100, round(v.tFill*10)/10, yn{1+v.repark}, yn{1+v.replan}, outNames{v.oc}, v.remark};
+end
+fs = {'Fuel','Vehicles fuelled','Litres sold','Rate (INR/L)','Revenue (INR)','Share of revenue (%)'};
+for k = 1:2
+    fs(k+1,:) = {upper(fuelNames{k}), sum(fd_all == k), round(sum(lit(fd_all == k))*10)/10, price(k), ...
+        round(sum(amt(fd_all == k))*100)/100, round(1000*sum(amt(fd_all == k))/max(sum(amt),eps))/10};
+end
+fs(4,:) = {'TOTAL', sum(fd_all > 0), round(sum(lit)*10)/10, '-', round(sum(amt)*100)/100, 100};
+vt = {'Vehicle category','Vehicles arrived','Share (%)','Served OK','Refused / stopped','Litres dispensed','Revenue (INR)', ...
+      'Avg litres per vehicle','Avg fill time (s)','Avg wait (s)'};
+for k = 1:4
+    m = cats == k; mf = m & lit > 0;
+    vt(k+1,:) = {catNames{k}, sum(m), round(1000*sum(m)/N)/10, sum(m & okMask), sum(m & ~okMask), round(sum(lit(m))*10)/10, ...
+        round(sum(amt(m))*100)/100, round(safeMean(lit(mf))*10)/10, round(safeMean([R(mf).tFill])*10)/10, round(safeMean([R(m).wait]))};
+end
+vt(6,:) = {'TOTAL', N, 100, sum(okMask), sum(~okMask), round(sum(lit)*10)/10, round(sum(amt)*100)/100, ...
+    round(safeMean(lit(lit>0))*10)/10, round(safeMean([R(lit>0).tFill])*10)/10, round(safeMean([R.wait]))};
+stock0 = [P.PetrolStock P.DieselStock]; sold = [petrolL dieselL];
+tk = {'Fuel','Opening stock (L)','Sold (L)','Closing stock (L)','Closing stock (%)','Status'};
+lowAlert = {};
+for k = 1:2
+    cl = stock0(k) - sold(k); pc = 100*cl/stock0(k);
+    if pc < 20, st = 'LOW - reorder now'; lowAlert{end+1} = sprintf('%s stock is low (%.0f L left, %.0f %%) - reorder.', upper(fuelNames{k}), cl, pc); %#ok<AGROW>
+    else, st = 'OK'; end
+    tk(k+1,:) = {upper(fuelNames{k}), stock0(k), round(sold(k)*10)/10, round(cl*10)/10, round(pc*10)/10, st};
+end
+fa = {'Vehicle ID','Registration','Time','Vehicle type','Fuel selected','Event','Litres dispensed before stop','Details'};
+for k = 1:N
+    v = R(k);
+    if v.oc ~= 1 || v.repark || v.replan
+        if v.oc ~= 1, ev = outNames{v.oc}; elseif v.repark, ev = 'Info - repositioned (unsafe parking)'; else, ev = 'Info - obstacle re-plan'; end
+        fa(end+1,:) = {v.id, v.plate, fmt(v.tStart), upper(names{v.t}), fuelNames{v.custFuel}, ev, round(v.litres*10)/10, v.remark}; %#ok<AGROW>
+    end
+end
+if size(fa,1) == 1, fa(2,:) = {'-','-','-','-','-','No faults or events','-','-'}; end
+MS = {'Vehicle ID','Registration','Outcome','Motion time (s)','Tool-tip path length (m)','Peak tool-tip speed (m/s)', ...
+      'Peak tool-tip accel (m/s^2)','Peak gantry speed (m/s)','Peak shoulder speed (deg/s)','Peak elbow speed (deg/s)', ...
+      'Peak vehicle speed (m/s)','Graph file'};
+for k = 1:N
+    m = motionStats(R(k).motion); [~,gf] = fileparts(R(k).graph);
+    if isempty(R(k).graph), gf = '-'; else, gf = [gf '.png']; end
+    MS(k+1,:) = {R(k).id, R(k).plate, outNames{R(k).oc}, round(m.dur*10)/10, round(m.path*100)/100, round(m.vTip*1000)/1000, ...
+        round(m.aTip*1000)/1000, round(m.vGantry*1000)/1000, round(m.vShoulder*10)/10, round(m.vElbow*10)/10, round(m.vVeh*1000)/1000, gf}; %#ok<AGROW>
+end
+nWrong = sum(oc_all == 2); nCal = sum(oc_all == 3); nTrip = sum(oc_all >= 4);
+[~,bi] = max(sum(bsxfun(@eq, cats(:), 1:4),1)); [~,bf] = max(sold); if sum(sold) == 0, bf = 1; end
+valid = [R.det] > 0;
+S = {'Metric','Value';
+    'Station', P.StationName; 'Report date', datestr(now,'dd-mmm-yyyy'); ...
+    'Run period', sprintf('%s to %s', fmt(firstArr), fmt(shiftEnd)); '','';
+    'VEHICLES','';
+    'Vehicles arrived', N; 'Fuelled successfully', sum(okMask); 'Refused - wrong fuel', nWrong; ...
+    'Refused - inlet detection error', nCal; 'Emergency stops (leak / pressure / vehicle moved / other)', nTrip; ...
+    'Success rate (%)', round(1000*sum(okMask)/N)/10; ...
+    'Cars (petrol)', catCount(1); 'Cars (diesel)', catCount(2); 'Lorries', catCount(3); 'Bikes', catCount(4); ...
+    'Most frequent vehicle type', catNames{bi}; '','';
+    'FUEL SOLD','';
+    'Petrol sold (L)', round(petrolL*10)/10; 'Diesel sold (L)', round(dieselL*10)/10; 'Total fuel sold (L)', round(sum(lit)*10)/10; ...
+    'Petrol revenue (INR)', round(petrolL*price(1)*100)/100; 'Diesel revenue (INR)', round(dieselL*price(2)*100)/100; ...
+    'TOTAL REVENUE (INR)', round(sum(amt)*100)/100; ...
+    'Average litres per fuelled vehicle', round(safeMean(lit(lit>0))*10)/10; ...
+    'Best-selling fuel', upper(fuelNames{bf}); '','';
+    'ROBOT / OPERATIONS','';
+    'Average wait in queue (s)', round(safeMean([R.wait])); 'Longest wait (s)', round(max([R.wait])); ...
+    'Average service time per vehicle (s)', round(safeMean([R.tSvc])); ...
+    'Robot bay utilisation (%)', round(util*10)/10; ...
+    'Vehicle-type detection accuracy (%)', round(1000*sum([R(valid).det] == [R(valid).t])/max(sum(valid),1))/10; ...
+    'Average inlet detection error (mm)', round(safeMean([R.detErr])*100)/100; ...
+    'Highest line pressure (bar)', round(max([R.peak])*100)/100; ...
+    'Vehicles repositioned (unsafe parking)', sum([R.repark]); 'Obstacle re-plans', sum([R.replan]); '','';
+    'OWNER NOTES','' };
+notes = {};
+if nWrong > 0, notes{end+1} = sprintf('%d customer(s) chose the wrong fuel and were refused by the robot - consider clearer signage.', nWrong); end
+if nTrip > 0, notes{end+1} = sprintf('%d emergency stop(s) - check the hose/nozzle and vehicle-motion alerts on the Faults & Alerts sheet.', nTrip); end
+if nCal > 0, notes{end+1} = sprintf('%d inlet detection failure(s) - re-calibrate the camera.', nCal); end
+if util > 80, notes{end+1} = 'Bay utilisation is very high - customers queue; a second robot bay would increase sales.'; end
+notes = [notes lowAlert];
+if isempty(notes), notes{1} = 'No issues - normal operation.'; end
+for k = 1:numel(notes), S(end+1,:) = {sprintf('%d.',k), notes{k}}; end %#ok<AGROW>
+
+%% ---------------- full report in the Command Window ----------------
+fprintf('\n\n==================================================================================\n');
+fprintf('  FULL REPORT - %s - %s   (%s to %s)\n', P.StationName, datestr(now,'dd-mmm-yyyy'), fmt(firstArr), fmt(shiftEnd));
+fprintf('==================================================================================\n');
+printTable('ALL VEHICLES', T(:,[1 2 3 5 9 10 13 14 17 18 20 7 8 25]));
+printTable('FUEL SALES', fs);
+printTable('VEHICLE TYPES', vt);
+printTable('TANK STOCK', tk);
+printTable('FAULTS & ALERTS', fa);
+printTable('MOTION SUMMARY (velocity / acceleration peaks per vehicle)', MS);
+printTable('OWNER SUMMARY', S);
+
+%% ---------------- motion graphs for all vehicles ----------------
+if P.SaveGraphs
+    saveMotionOverview(R, gdir);
+    motion = struct('id',{R.id},'plate',{R.plate},'columns',{{'t_s','q1_gantry_m','q2_shoulder_rad','q3_elbow_rad','qd1','qd2','qd3','qdd1','qdd2','qdd3','tipX_m','tipY_m','tipZ_m','vehicleX_m'}},'data',{R.motion}); %#ok<NASGU>
+    save(fullfile(gdir,'motion_data.mat'),'motion');
+    fprintf('\nMotion graphs (one PNG per vehicle + overview) and motion_data.mat saved in:\n  %s\n', gdir);
+end
+
+%% ---------------- Excel report ----------------
+file = char(P.File);
+if isempty(file), file = ['Fuel_Station_Report_' datestr(now,'yyyymmdd_HHMMSS') '.xlsx']; end
+[fd,~,~] = fileparts(file); if isempty(fd), file = fullfile(pwd,file); end
+if exist(file,'file'), try, delete(file); catch, file = strrep(file,'.xlsx',['_' datestr(now,'HHMMSS') '.xlsx']); end, end
+writeSheet(file,'Owner Summary',S);
+writeSheet(file,'Transactions',T);
+writeSheet(file,'Fuel Sales',fs);
+writeSheet(file,'Vehicle Types',vt);
+writeSheet(file,'Tank Stock',tk);
+writeSheet(file,'Faults & Alerts',fa);
+writeSheet(file,'Motion Summary',MS);
+formatExcel(file);
+fprintf('\nExcel report saved: %s\n\n', file);
+out = struct('file',file,'vehicles',R,'petrolLitres',petrolL,'dieselLitres',dieselL,'revenue',sum(amt), ...
+             'served',sum(okMask),'refused',nWrong+nCal,'stopped',nTrip);
+end
+
+function v = genVehicle(P, id, arr)
+% one random arrival (the station is NOT told the type - the workflow detects it)
+letters = 'ABCDEFGHJKLMNPRSTUVWXYZ';
+u = rand;
+if u < 0.50, t = 1; elseif u < 0.80, t = 3; else, t = 2; end          % 50 % cars, 30 % bikes, 20 % lorries
+eng = 1 + (rand < 0.5);                                               % car engine: 1 petrol, 2 diesel
+names = {'car','lorry','bike'};
+V = vehicleDef(names{t}, eng);
+v.id = sprintf('V%02d',id);
+v.plate = sprintf('AP%02d %s%s %04d', randi(39), letters(randi(numel(letters))), letters(randi(numel(letters))), randi(9999));
+v.t = t; v.V = V; v.eng = eng; v.needFuel = V.fuel;
+v.custFuel = V.fuel; if rand < P.WrongFuelChance, v.custFuel = 3 - V.fuel; end
+lvl = 0.05 + 0.55*rand; space = V.tank*(1 - lvl);                     % tank 5..60 % full on arrival
+if rand < 0.30, want = space; else, want = space*(0.30 + 0.70*rand); end
+v.level = 100*lvl; v.want = min(space, max(2, round(want*2)/2));
+v.want = max(1, min(v.want, P.MaxLitres));                           % keep fills small so the simulation is fast
+v.arrive = arr;
+v.calFail = rand < 0.03;                                              % camera not calibrated -> inlet detection error
+v.unsafe = rand < 0.25; v.obstacle = rand < 0.10;
+v.fault = 'none'; v.moveMode = 'none';
+if v.custFuel == v.needFuel && ~v.calFail && rand < P.FaultChance
+    k = randi(3);
+    if k == 1, v.fault = 'leak'; elseif k == 2, v.fault = 'overpressure'; else, v.moveMode = 'fuelling'; end
+end
+v.noiseSeed = randi(1e6);
+if t == 1, v.cat = eng; elseif t == 2, v.cat = 3; else, v.cat = 4; end
+% result fields (filled in when the vehicle is served) - same field set for every vehicle
+v.oc = 0; v.tStart = 0; v.tEnd = 0; v.wait = 0; v.tSvc = 0; v.litres = 0; v.amount = 0; v.peak = 0;
+v.tFill = 0; v.remark = ''; v.fuelDisp = 0; v.det = 0; v.f = NaN; v.zone = ''; v.detErr = NaN;
+v.repark = false; v.replan = false; v.motion = []; v.tFS = NaN; v.tFE = NaN; v.graph = '';
+end
+
+function r = ternary(c, a, b)
+if c, r = a; else, r = b; end
+end
+
+function printTable(titleStr, C)
+% prints a cell array as an aligned text table in the Command Window
+[nr,nc] = size(C); S = cell(nr,nc); w = zeros(1,nc);
+for i = 1:nr
+    for j = 1:nc
+        x = C{i,j};
+        if ischar(x), s = x; elseif isempty(x), s = ''; else, s = sprintf('%g',x); end
+        if numel(s) > 70, s = [s(1:67) '...']; end
+        S{i,j} = s; w(j) = max(w(j), numel(s));
+    end
+end
+fprintf('\n%s\n', titleStr);
+for i = 1:nr
+    line = '';
+    for j = 1:nc, line = [line sprintf('%-*s  ', w(j), S{i,j})]; end %#ok<AGROW>
+    fprintf('%s\n', deblank(line));
+    if i == 1, fprintf('%s\n', repmat('-', 1, min(numel(line), 200))); end
+end
+end
+
+function [V,A] = derivs(X, t)
+% velocity and acceleration of every column of X (sampled at times t)
+V = zeros(size(X)); A = zeros(size(X));
+for c = 1:size(X,2)
+    V(:,c) = gradient(X(:,c), t); A(:,c) = gradient(V(:,c), t);
+end
+end
+
+function st = motionStats(M)
+st = struct('dur',0,'path',0,'vTip',0,'aTip',0,'vGantry',0,'vShoulder',0,'vElbow',0,'vVeh',0);
+if isempty(M) || size(M,1) < 5, return; end
+t = M(:,1);
+[vt,at] = derivs(M(:,11:13), t); [vv,~] = derivs(M(:,14), t);
+st.dur = t(end) - t(1);
+st.path = sum(sqrt(sum(diff(M(:,11:13)).^2, 2)));
+st.vTip = max(sqrt(sum(vt.^2, 2))); st.aTip = max(sqrt(sum(at.^2, 2)));
+st.vGantry = max(abs(M(:,5)));
+st.vShoulder = max(abs(rad2deg(M(:,6)))); st.vElbow = max(abs(rad2deg(M(:,7))));
+st.vVeh = max(abs(vv));
+end
+
+function file = saveMotionGraph(v, gdir, n, outName)
+% position / velocity / acceleration graph of one vehicle (vehicle, gantry, joints, tool tip)
+file = ''; M = v.motion;
+if isempty(M) || size(M,1) < 5, return; end
+t = M(:,1);
+[vv,av] = derivs(M(:,14), t); [vt,at] = derivs(M(:,11:13), t);
+fg = figure('Visible','off','Color','w','Position',[40 40 1500 1000]);
+cols = {'Position','Velocity','Acceleration'};
+% row 1: vehicle
+motionAx(fg,1,cols{1},'Vehicle X (m)',t,M(:,14),{},v);
+motionAx(fg,2,cols{2},'(m/s)',t,vv,{},v);
+motionAx(fg,3,cols{3},'(m/s^2)',t,av,{},v);
+% row 2: gantry carriage
+motionAx(fg,4,'','Gantry carriage q1 (m)',t,M(:,2),{},v);
+motionAx(fg,5,'','(m/s)',t,M(:,5),{},v);
+motionAx(fg,6,'','(m/s^2)',t,M(:,8),{},v);
+% row 3: shoulder + elbow
+motionAx(fg,7,'','Shoulder / elbow (deg)',t,rad2deg(M(:,3:4)),{'shoulder q2','elbow q3'},v);
+motionAx(fg,8,'','(deg/s)',t,rad2deg(M(:,6:7)),{'shoulder','elbow'},v);
+motionAx(fg,9,'','(deg/s^2)',t,rad2deg(M(:,9:10)),{'shoulder','elbow'},v);
+% row 4: tool tip
+motionAx(fg,10,'','Tool tip (m)',t,M(:,11:13),{'x','y','z'},v);
+motionAx(fg,11,'','(m/s)',t,[vt sqrt(sum(vt.^2,2))],{'vx','vy','vz','speed'},v);
+motionAx(fg,12,'','(m/s^2)',t,[at sqrt(sum(at.^2,2))],{'ax','ay','az','|a|'},v);
+for k = 10:12, xlabel(subplot(4,3,k),'time (s)'); end
+sgtitle(sprintf('Vehicle %d  %s  (%s)  -  %s   |   dashed lines = fuelling start / end', n, v.plate, outName, ternary(v.t==1,'CAR',ternary(v.t==2,'LORRY','BIKE'))), 'FontWeight','bold','Interpreter','none');
+file = fullfile(gdir, sprintf('Vehicle_%02d_%s.png', n, strrep(v.plate,' ','_')));
+try, exportgraphics(fg, file, 'Resolution', 110); catch, saveas(fg, file); end
+close(fg);
+end
+
+function motionAx(fg, k, ttl, ylab, t, Y, leg, v)
+ax = subplot(4,3,k,'Parent',fg); hold(ax,'on'); grid(ax,'on'); box(ax,'on');
+plot(ax, t, Y, 'LineWidth', 1.2);
+if ~isempty(ttl), title(ax, ttl); end
+ylabel(ax, ylab); xlim(ax, [t(1) t(end)]);
+if ~isnan(v.tFS), xline(ax, v.tFS, 'k--'); end
+if ~isnan(v.tFE), xline(ax, v.tFE, 'k--'); end
+if ~isempty(leg), legend(ax, leg, 'Location','best','FontSize',7); end
+end
+
+function saveMotionOverview(R, gdir)
+% one figure comparing the motion of all vehicles
+N = numel(R); fg = figure('Visible','off','Color','w','Position',[40 40 1400 900]);
+a1 = subplot(2,2,1,'Parent',fg); hold(a1,'on'); grid(a1,'on'); title(a1,'Tool-tip speed - all vehicles'); xlabel(a1,'time since start of vehicle (s)'); ylabel(a1,'m/s');
+a2 = subplot(2,2,2,'Parent',fg); hold(a2,'on'); grid(a2,'on'); title(a2,'Vehicle speed - all vehicles'); xlabel(a2,'time since start of vehicle (s)'); ylabel(a2,'m/s');
+vT = zeros(1,N); aT = zeros(1,N); ids = cell(1,N); used = false(1,N);
+for k = 1:N
+    M = R(k).motion; ids{k} = R(k).id;
+    if isempty(M) || size(M,1) < 5, continue; end
+    used(k) = true; t = M(:,1) - M(1,1);
+    [vt,at] = derivs(M(:,11:13), M(:,1)); [vv,~] = derivs(M(:,14), M(:,1));
+    plot(a1, t, sqrt(sum(vt.^2,2))); plot(a2, t, abs(vv));
+    vT(k) = max(sqrt(sum(vt.^2,2))); aT(k) = max(sqrt(sum(at.^2,2)));
+end
+if N <= 12, legend(a1, ids(used), 'Location','best','FontSize',7); end
+a3 = subplot(2,2,3,'Parent',fg); bar(a3, 1:N, vT, 'FaceColor',[0.30 0.50 0.80]); grid(a3,'on');
+title(a3,'Peak tool-tip speed per vehicle'); xlabel(a3,'vehicle no.'); ylabel(a3,'m/s');
+a4 = subplot(2,2,4,'Parent',fg); bar(a4, 1:N, aT, 'FaceColor',[0.85 0.45 0.20]); grid(a4,'on');
+title(a4,'Peak tool-tip acceleration per vehicle'); xlabel(a4,'vehicle no.'); ylabel(a4,'m/s^2');
+sgtitle('Motion overview - all vehicles','FontWeight','bold');
+file = fullfile(gdir,'All_Vehicles_Overview.png');
+try, exportgraphics(fg, file, 'Resolution', 110); catch, saveas(fg, file); end
+close(fg);
+end
+
+
+function m = safeMean(x)
+if isempty(x), m = 0; else, m = mean(x); end
+end
+
+function s = addCommas(x)
+s = sprintf('%.0f', x); k = numel(s) - 3;
+while k > 0, s = [s(1:k) ',' s(k+1:end)]; k = k - 3; end
+end
+
+function writeSheet(file, sheet, C)
+% C is a cell array; writes it to one worksheet (works with or without Excel installed)
+for i = 1:numel(C), if isempty(C{i}), C{i} = ''; end, end
+if exist('writecell') > 0 %#ok<EXIST>
+    writecell(C, file, 'Sheet', sheet);
+else
+    xlswrite(file, C, sheet);
+end
+end
+
+function formatExcel(file)
+% Optional cosmetics (Windows + Excel installed): bold coloured header, auto-fit columns, freeze row 1.
+if ~ispc, return; end
+try
+    e = actxserver('Excel.Application'); e.DisplayAlerts = false;
+    wb = e.Workbooks.Open(file);
+    for s = 1:wb.Sheets.Count
+        sh = wb.Sheets.Item(s);
+        sh.Cells.EntireColumn.AutoFit;
+        h = sh.Rows.Item(1); h.Font.Bold = true; h.Font.Color = 16777215; h.Interior.Color = 9981952;
+        sh.Activate; e.ActiveWindow.SplitRow = 1; e.ActiveWindow.FreezePanes = true;
+        if s == 1, sh.Columns.Item(1).ColumnWidth = 48; sh.Columns.Item(2).ColumnWidth = 40; end
+    end
+    wb.Sheets.Item(1).Activate;
+    wb.Save; wb.Close; e.Quit; delete(e);
+catch
+end
+end
